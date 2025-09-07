@@ -17,10 +17,10 @@ jobs:
       uses: appleboy/ssh-action@v1.0.3
       with:
         host: 72.60.45.92
-        username: mana
-        key: ${{ secrets.SSH_PRIVATE_KEY }}
+        username: root
+        password: ${{ secrets.SSH_PASSWORD }}
         script: |
-          cd /home/mana/mana-project
+          cd /root/mana-project
           git pull origin main
           docker-compose down
           docker-compose up -d --build
