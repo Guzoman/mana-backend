@@ -1,0 +1,28 @@
+name: Deploy to Server
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Deploy to server
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: 72.60.45.92
+        username: mana
+        key: ${{ secrets.SSH_PRIVATE_KEY }}
+        script: |
+          cd /home/mana/mana-project
+          git pull origin main
+          docker-compose down
+          docker-compose up -d --build
+          docker system prune -af
+          echo "Deploy completed successfully"
