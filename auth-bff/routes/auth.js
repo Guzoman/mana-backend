@@ -7,6 +7,7 @@ const {
 } = require('@simplewebauthn/server');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const fetch = require('node-fetch');
 const { AuthRpcSchema, validateBody } = require('../schemas/rpc');
 
 const router = express.Router();
@@ -30,6 +31,10 @@ router.post('/rpc', validateBody(AuthRpcSchema), async (req, res) => {
         return await handleLoginStart(req, res, { config, challengeCache });
       case 'webauthn.login.finish':
         return await handleLoginFinish(req, res, { pool, logger, config, challengeCache });
+      case 'auth.validate':
+        return await handleAuthValidate(req, res, { pool, logger, config });
+      case 'flowise.validate':
+        return await handleFlowiseValidate(req, res, { pool, logger, config });
       default:
         return res.status(400).json({
           error: 'op_unknown',
@@ -50,6 +55,31 @@ router.post('/rpc', validateBody(AuthRpcSchema), async (req, res) => {
     });
   }
 });
+
+async function handleRegisterStart(req, res, { config, challengeCache }) {
+  const { userId } = req.body;
+  
+  const options = await generateRegistrationOptions({
+    rpName: config.webauthn.rpName,
+    rpID: config.webauthn.rpId,
+    userID: Buffer.from(userId, 'utf8'),
+    userName: `user_${userId}`,
+    userDisplayName: 'Mana User',
+    timeout: 60000,
+    attestationType: 'none',
+    authenticatorSelection: {
+      userVerification: 'preferred',
+      residentKey: 'preferred',
+    },
+  });
+  
+  challengeCache.set(`reg:${userId}`, options.challenge, 300);
+  
+  res.json({
+    ok: true,
+    publicKey: options,
+  });
+}
 
 async function handleRegisterFinish(req, res, { pool, logger, config, challengeCache }) {
   const { userId, attestation } = req.body;
@@ -85,14 +115,14 @@ async function handleRegisterFinish(req, res, { pool, logger, config, challengeC
       await client.query('BEGIN');
       
       await client.query(
-        'INSERT INTO users (id, created_at) VALUES (, NOW()) ON CONFLICT (id) DO NOTHING',
+        'INSERT INTO users (id, created_at) VALUES ($1, NOW()) ON CONFLICT (id) DO NOTHING',
         [userId]
       );
       
       await client.query(`
         INSERT INTO webauthn_credentials (
           credential_id, user_id, public_key, counter, transports, created_at
-        ) VALUES (, , , , , NOW())
+        ) VALUES ($1, $2, $3, $4, $5, NOW())
         ON CONFLICT (credential_id) DO UPDATE SET 
           counter = EXCLUDED.counter,
           updated_at = NOW()
@@ -108,13 +138,35 @@ async function handleRegisterFinish(req, res, { pool, logger, config, challengeC
       
       challengeCache.del(`reg:${userId}`);
       
+      // Generate JWT token for new user
+      const token = jwt.sign(
+        {
+          sub: userId,
+          iss: 'mana-auth',
+          aud: 'mana-api',
+          iat: Math.floor(Date.now() / 1000),
+        },
+        config.jwt.secret,
+        { expiresIn: `${config.jwt.ttl}s` }
+      );
+      
       logger.info('User registered successfully', {
         requestId: req.id,
         userId,
         credentialId: bufferToBase64url(credentialID),
       });
       
-      res.json({ ok: true });
+      res.json({ 
+        ok: true,
+        access_token: token,
+        token_type: 'Bearer',
+        expires_in: config.jwt.ttl,
+        user: {
+          id: userId,
+          email_verified: false,
+          created_at: new Date().toISOString(),
+        },
+      });
       
     } catch (dbError) {
       await client.query('ROLLBACK');
@@ -178,7 +230,7 @@ async function handleLoginFinish(req, res, { pool, logger, config, challengeCach
         u.email_verified
       FROM webauthn_credentials wc
       JOIN users u ON u.id = wc.user_id
-      WHERE wc.credential_id =  AND wc.revoked = false
+      WHERE wc.credential_id = $1 AND wc.revoked = false
     `, [credentialId]);
     
     if (credResult.rows.length === 0) {
@@ -210,13 +262,13 @@ async function handleLoginFinish(req, res, { pool, logger, config, challengeCach
     }
     
     await pool.query(
-      'UPDATE webauthn_credentials SET counter = , updated_at = NOW() WHERE credential_id = ',
+      'UPDATE webauthn_credentials SET counter = $1, updated_at = NOW() WHERE credential_id = $2',
       [verification.authenticationInfo.newCounter, credentialId]
     );
     
     const [saveCheck, userInfo] = await Promise.all([
-      pool.query('SELECT 1 FROM player_saves WHERE user_id =  LIMIT 1', [credential.user_id]),
-      pool.query('SELECT email_verified FROM users WHERE id = ', [credential.user_id]),
+      pool.query('SELECT 1 FROM player_saves WHERE user_id = $1 LIMIT 1', [credential.user_id]),
+      pool.query('SELECT email_verified, created_at FROM users WHERE id = $1', [credential.user_id]),
     ]);
     
     const token = jwt.sign(
@@ -243,8 +295,12 @@ async function handleLoginFinish(req, res, { pool, logger, config, challengeCach
       access_token: token,
       token_type: 'Bearer',
       expires_in: config.jwt.ttl,
+      user: {
+        id: credential.user_id,
+        email_verified: userInfo.rows[0]?.email_verified || false,
+        created_at: userInfo.rows[0]?.created_at,
+      },
       hasSave: saveCheck.rows.length > 0,
-      hasEmailVerified: userInfo.rows[0]?.email_verified === true,
     });
     
   } catch (error) {
@@ -257,6 +313,172 @@ async function handleLoginFinish(req, res, { pool, logger, config, challengeCach
     res.status(401).json({
       error: 'authentication_failed',
       message: 'Could not complete authentication',
+    });
+  }
+}
+
+async function handleAuthValidate(req, res, { pool, logger, config }) {
+  const authHeader = req.headers.authorization;
+  
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({
+      error: 'token_missing',
+      message: 'Authorization token required',
+    });
+  }
+  
+  const token = authHeader.slice(7);
+  
+  try {
+    // Verify JWT token
+    const decoded = jwt.verify(token, config.jwt.secret);
+    const userId = decoded.sub;
+    
+    // Check if user exists in database
+    const userResult = await pool.query(
+      'SELECT id, email_verified, created_at FROM users WHERE id = $1',
+      [userId]
+    );
+    
+    if (userResult.rows.length === 0) {
+      return res.status(401).json({
+        error: 'user_not_found',
+        message: 'User account no longer exists',
+      });
+    }
+    
+    const user = userResult.rows[0];
+    
+    // Check if user has valid credentials
+    const credResult = await pool.query(
+      'SELECT COUNT(*) as count FROM webauthn_credentials WHERE user_id = $1 AND revoked = false',
+      [userId]
+    );
+    
+    if (credResult.rows[0].count === 0) {
+      return res.status(401).json({
+        error: 'credentials_revoked',
+        message: 'User credentials have been revoked',
+      });
+    }
+    
+    // Check for game save
+    const saveResult = await pool.query(
+      'SELECT COUNT(*) as count FROM player_saves WHERE user_id = $1',
+      [userId]
+    );
+    
+    logger.info('Token validation successful', {
+      requestId: req.id,
+      userId,
+    });
+    
+    res.json({
+      ok: true,
+      user: {
+        id: user.id,
+        email_verified: user.email_verified,
+        created_at: user.created_at,
+      },
+      hasSave: saveResult.rows[0].count > 0,
+    });
+    
+  } catch (error) {
+    if (error.name === 'JsonWebTokenError') {
+      return res.status(401).json({
+        error: 'token_invalid',
+        message: 'Invalid authorization token',
+      });
+    }
+    
+    if (error.name === 'TokenExpiredError') {
+      return res.status(401).json({
+        error: 'token_expired',
+        message: 'Authorization token has expired',
+      });
+    }
+    
+    logger.error('Token validation failed:', {
+      requestId: req.id,
+      error: error.message,
+      stack: error.stack,
+    });
+    
+    res.status(500).json({
+      error: 'validation_failed',
+      message: 'Could not validate token',
+    });
+  }
+}
+
+async function handleFlowiseValidate(req, res, { pool, logger, config }) {
+  const { userId } = req.body;
+  
+  try {
+    // Llamar al agentflow de Flowise con el userId
+    const flowiseUrl = process.env.FLOWISE_URL || 'http://flowise:3000';
+    const flowId = process.env.FLOWISE_FLOW_ID || 'ec813128-dbbc-4ffd-b834-cc15a361ccb1'; // ID del agentflow de debug
+    
+    const flowiseResponse = await fetch(`${flowiseUrl}/api/v1/prediction/${flowId}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        question: userId || '', // Enviar userId como question (input)
+        overrideConfig: {
+          vars: {
+            userId: userId || ''
+          }
+        }
+      })
+    });
+    
+    if (!flowiseResponse.ok) {
+      throw new Error(`Flowise responded with status: ${flowiseResponse.status}`);
+    }
+    
+    const flowiseResult = await flowiseResponse.text();
+    let parsedResult;
+    
+    try {
+      parsedResult = JSON.parse(flowiseResult);
+    } catch (parseError) {
+      // Si no es JSON válido, retornar error
+      logger.error('Flowise returned invalid JSON:', {
+        requestId: req.id,
+        userId,
+        response: flowiseResult,
+      });
+      
+      return res.status(500).json({
+        error: 'flowise_invalid_response',
+        message: 'Flowise returned invalid response format',
+      });
+    }
+    
+    logger.info('Flowise validation completed:', {
+      requestId: req.id,
+      userId,
+      result: parsedResult,
+    });
+    
+    res.json({
+      ok: true,
+      result: parsedResult,
+    });
+    
+  } catch (error) {
+    logger.error('Flowise validation failed:', {
+      requestId: req.id,
+      userId,
+      error: error.message,
+      stack: error.stack,
+    });
+    
+    res.status(500).json({
+      error: 'flowise_validation_failed',
+      message: 'Could not validate user with Flowise',
     });
   }
 }
