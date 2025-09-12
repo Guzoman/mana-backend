@@ -36,16 +36,19 @@ jobs:
           docker compose build auth-bff
           
           echo "🚀 Restarting services..."
-          docker compose restart auth-bff
+          docker compose up -d --build auth-bff
           
           echo "✅ Waiting for health check..."
-          sleep 10
+          sleep 15
           
           echo "📊 Container status:"
           docker ps | grep -E "(auth-bff|flowise|mana-pg|reverse-proxy)"
           
           echo "🩺 Health check:"
           curl -f http://localhost/health || echo "❌ Health check failed"
+          
+          echo "📋 Recent logs:"
+          docker compose logs auth-bff --tail 10
           
           echo "✅ Deployment completed!"
           EOF
