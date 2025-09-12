@@ -1,19 +1,19 @@
-import express from 'express';
-import cors from 'cors';
-import morgan from 'morgan';
-import pg from 'pg';
-import jwt from 'jsonwebtoken';
-import axios from 'axios';
-import { z } from 'zod';
-import crypto from 'crypto';
-import {
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const morgan = require('morgan');
+const { Pool } = require('pg');
+const jwt = require('jsonwebtoken');
+const axios = require('axios');
+const { z } = require('zod');
+const crypto = require('crypto');
+const {
   generateRegistrationOptions,
   verifyRegistrationResponse,
   generateAuthenticationOptions,
   verifyAuthenticationResponse
-} from '@simplewebauthn/server';
+} = require('@simplewebauthn/server');
 
-const { Pool } = pg;
 const app = express();
 const port = process.env.PORT || 3000;
 
@@ -36,11 +36,11 @@ const pool = new Pool({
   ssl: process.env.DATABASE_SSL === 'true'
 });
 
-// Test database connection
+// Test database connection (non-fatal for now)
 pool.connect((err, client, release) => {
   if (err) {
     console.error('❌ Error connecting to database:', err.message);
-    process.exit(1);
+    console.log('⚠️  Continuing without database connection for testing...');
   } else {
     console.log('✅ Database connected successfully');
     release();
@@ -53,7 +53,17 @@ const allowList = rawOrigins.split(',').map(s => s.trim()).filter(Boolean);
 
 const corsOptions = {
   origin: function (origin, callback) {
-    if (!origin || allowList.includes(origin)) return callback(null, true);
+    // Allow no origin (server-to-server)
+    if (!origin) return callback(null, true);
+    
+    // Allow production domains
+    if (allowList.includes(origin)) return callback(null, true);
+    
+    // Allow any localhost port for development
+    if (origin.match(/^https?:\/\/localhost:\d+$/)) {
+      return callback(null, true);
+    }
+    
     return callback(new Error('CORS not allowed for origin: ' + origin));
   },
   methods: ['GET', 'HEAD', 'POST', 'OPTIONS'],
@@ -77,6 +87,7 @@ app.locals.config = {
   jwtSecret: process.env.JWT_SECRET,
   jwtTtl: process.env.JWT_TTL || '3600',
   flowiseUrl: process.env.FLOWISE_URL || 'http://flowise:3000',
+  flowiseApiKey: process.env.FLOWISE_API_KEY,
   rpId: process.env.RP_ID || 'manaproject.app',
   origin: process.env.ORIGIN || 'https://manaproject.app'
 };
@@ -178,10 +189,10 @@ app.post('/api/auth/webauthn/register/begin', async (req, res) => {
       rpID: app.locals.config.rpId,
       userID: userId,
       userName: String(username),
-      timeout: 60000,
+      timeout: 120000,
       attestationType: 'none',
       authenticatorSelection: {
-        userVerification: 'preferred',
+        userVerification: 'discouraged', // Allow PIN and other convenient methods
         residentKey: 'preferred',
         requireResidentKey: false,
       },
@@ -246,9 +257,14 @@ app.post('/api/auth/webauthn/authenticate/begin', async (req, res) => {
   try {
     const options = await generateAuthenticationOptions({
       rpID: app.locals.config.rpId,
-      timeout: 60000,
-      userVerification: 'preferred',
+      timeout: 120000,
+      userVerification: 'discouraged', // Allow PIN and other convenient methods
       allowCredentials: [], // rely on resident/discoverable credentials
+      authenticatorSelection: {
+        userVerification: 'discouraged',
+        residentKey: 'preferred',
+        requireResidentKey: false,
+      }
     });
 
     issuedAuthChallenges.add(options.challenge);
@@ -329,6 +345,141 @@ app.post('/api/chat', (req, res) => {
     response: message ? `Echo: ${message}` : 'Hola desde MANA local',
     timestamp: new Date().toISOString()
   });
+});
+
+// Flowise validation endpoint
+app.post('/api/auth/rpc', async (req, res) => {
+  const { op, userId } = req.body || {};
+  
+  if (op === 'flowise.validate') {
+    try {
+      // Llamar al agentflow de Flowise con el userId
+      const flowiseUrl = app.locals.config.flowiseUrl;
+      const flowId = process.env.FLOWISE_FLOW_ID || 'ec813128-dbbc-4ffd-b834-cc15a361ccb1'; // ID del agentflow de debug
+      
+      const requestBody = {
+        question: userId || '', // Enviar userId como question (input)
+        overrideConfig: {
+          userId: userId || null,
+          userLanguage: 'es'
+        }
+      };
+      
+      console.log('🔧 DEBUG: Enviando solicitud a Flowise:', {
+        url: `${flowiseUrl}/api/v1/prediction/${flowId}`,
+        body: requestBody
+      });
+      
+      const flowiseResponse = await axios.post(`${flowiseUrl}/api/v1/prediction/${flowId}`, requestBody, {
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${app.locals.config.flowiseApiKey || ''}`
+        },
+        timeout: 30000
+      });
+      
+      console.log('🔧 DEBUG: Respuesta de Flowise:', {
+        status: flowiseResponse.status,
+        statusText: flowiseResponse.statusText,
+        data: flowiseResponse.data
+      });
+      
+      let parsedResult;
+      try {
+        // Si la respuesta ya es un objeto, usarla directamente
+        parsedResult = typeof flowiseResponse.data === 'string' 
+          ? JSON.parse(flowiseResponse.data) 
+          : flowiseResponse.data;
+      } catch (parseError) {
+        // Si no es JSON válido, retornar error
+        console.error('Flowise returned invalid JSON:', flowiseResponse.data);
+        
+        return res.status(500).json({
+          ok: false,
+          error: 'flowise_invalid_response',
+          message: 'Flowise returned invalid response format',
+        });
+      }
+      
+      console.log('Flowise validation completed:', { userId, result: parsedResult });
+      
+      res.json({
+        ok: true,
+        result: parsedResult,
+      });
+      
+    } catch (error) {
+      console.error('Flowise validation failed:', error.message);
+      
+      res.status(500).json({
+        ok: false,
+        error: 'flowise_validation_failed',
+        message: 'Could not validate user with Flowise',
+      });
+    }
+  } else {
+    res.status(400).json({
+      ok: false,
+      error: 'op_unknown',
+      message: `Unknown operation: ${op}`,
+    });
+  }
+});
+
+// Flowise API proxy endpoint
+app.post('/api/flowise/prediction/:flowId', async (req, res) => {
+  const { flowId } = req.params;
+  const flowiseUrl = process.env.FLOWISE_URL || 'http://flowise:3000';
+  const flowiseApiKey = process.env.FLOWISE_API_KEY;
+  
+  try {
+    console.log(`🔄 Proxying Flowise request to: ${flowiseUrl}/api/v1/prediction/${flowId}`);
+    
+    // Forward request to Flowise with API key if available
+    const headers = {
+      'Content-Type': 'application/json',
+      'User-Agent': 'MANA-BFF/1.0'
+    };
+    
+    if (flowiseApiKey) {
+      headers['Authorization'] = `Bearer ${flowiseApiKey}`;
+    }
+    
+    const flowiseResponse = await axios({
+      method: 'post',
+      url: `${flowiseUrl}/api/v1/prediction/${flowId}`,
+      headers: headers,
+      data: req.body,
+      timeout: 30000 // 30 second timeout
+    });
+    
+    console.log(`✅ Flowise response status: ${flowiseResponse.status}`);
+    
+    // Forward the response back to client
+    res.status(flowiseResponse.status).json(flowiseResponse.data);
+    
+  } catch (error) {
+    console.error('❌ Flowise proxy error:', error.message);
+    
+    if (error.response) {
+      // Flowise returned an error response
+      res.status(error.response.status).json({
+        error: 'flowise_error',
+        message: error.response.data?.message || 'Flowise API error',
+        details: error.response.data
+      });
+    } else if (error.code === 'ECONNREFUSED') {
+      res.status(502).json({
+        error: 'flowise_unavailable',
+        message: 'Flowise service is not available'
+      });
+    } else {
+      res.status(500).json({
+        error: 'proxy_error',
+        message: 'Internal proxy error'
+      });
+    }
+  }
 });
 
 // Share chat endpoint
@@ -420,6 +571,10 @@ app.get('/api/chat/:shareId', async (req, res) => {
   }
 });
 
+// Public Flowise API endpoint (no auth required)
+const flowiseRouter = require('./routes/flowise');
+app.use('/flowise-api', flowiseRouter);
+
 // Fallback 404 for /api
 app.use('/api', (req, res) => {
   res.status(404).json({ 
@@ -456,4 +611,4 @@ app.listen(port, () => {
   console.log(`✨ Environment: ${process.env.NODE_ENV || 'development'}`);
 });
 
-export default app;
+module.exports = app;
