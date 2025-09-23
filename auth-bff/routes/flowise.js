@@ -3,171 +3,180 @@ const axios = require('axios');
 const { z } = require('zod');
 const router = express.Router();
 
-// Schema for validateUser request
-const ValidateUserSchema = z.object({
-  userId: z.string().min(1),
-  language: z.string().default('es')
+// Schema for frontend payload validation
+const FrontendPayloadSchema = z.object({
+  question: z.any().optional(),
+  variables: z.object({
+    userId: z.string(),
+    language: z.string().default('es'),
+    caps: z.object({
+      webauthn: z.boolean().default(true)
+    }).optional()
+  }).optional()
 });
 
-// ===== /flowise-api/prediction/:flowId - Public Flowise endpoint =====
-router.post('/prediction/:flowId', async (req, res) => {
+// ===== /flowise-api - Root endpoint for user validation =====
+router.post('/', async (req, res) => {
   const { logger } = req.app.locals;
-  const { flowId } = req.params;
-  const { question, overrideConfig } = req.body;
-  
-  if (!question) {
-    return res.status(400).json({ 
-      error: 'bad_request', 
-      message: 'question is required' 
-    });
-  }
 
   try {
-    const payload = {
-      question,
-      overrideConfig: overrideConfig || {}
-    };
-    
-    const flowiseUrl = process.env.FLOWISE_URL || 'http://flowise:3000';
-    const url = `${flowiseUrl}/api/v1/prediction/${encodeURIComponent(flowId)}`;
-    
-    logger.info('Proxying to Flowise:', { flowId, question });
-    
-    const response = await axios.post(url, payload, {
-      headers: { 
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.FLOWISE_API_KEY || 'gaXY1T5ZWw5OBnRz8zqItQ1BVwKeEjXhLU7_CmMJ_cg'}`
-      },
-      timeout: 30000, // 30s timeout
-    });
-    
-    logger.info('Flowise response successful:', { flowId });
-    return res.json(response.data);
-    
-  } catch (error) {
-    logger.error('Flowise request failed:', { 
-      error: error.message, 
-      flowId,
-      response: error.response?.data 
-    });
-    
-    if (error.response) {
-      return res.status(error.response.status).json({
-        error: 'flowise_error',
-        message: error.response.data.message || 'Flowise service error'
+    // Validate and parse frontend payload
+    const validation = FrontendPayloadSchema.safeParse(req.body);
+    if (!validation.success) {
+      console.log('❌ Invalid frontend payload:', validation.error);
+      return res.status(400).json({
+        version: '1.0.0',
+        success: false,
+        case: 'ERR_INTERNAL',
+        message: 'Invalid request payload format',
+        webauthn: { action: 'skip' },
+        nextRoute: 'Lobby',
+        uiState: { turn: 0, step: 'intro', counters: { energy: 0 } },
+        playerState: {}
       });
     }
-    
-    return res.status(502).json({ 
-      error: 'flowise_upstream', 
-      message: 'Flowise service temporarily unavailable' 
-    });
-  }
-});
 
-// ===== /flowise-api/rpc/validateUser - Public user validation endpoint =====
-router.post('/rpc/validateUser', async (req, res) => {
-  const { logger } = req.app.locals;
+    const { variables } = validation.data;
+    const userId = variables?.userId || '';
+    const language = variables?.language || 'es';
 
-  // Validate request body
-  const validation = ValidateUserSchema.safeParse(req.body);
-  if (!validation.success) {
-    return res.status(400).json({
-      success: false,
-      error: 'invalid_request',
-      message: 'Invalid request body'
-    });
-  }
-
-  const { userId, language } = validation.data;
-
-  try {
-    console.log('Validating user:', { userId, language });
+    console.log('🔧 DEBUG: Received validation request:', { userId, language });
 
     // Validate UUID format
     const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-    if (!uuidRegex.test(userId)) {
+    if (userId && !uuidRegex.test(userId)) {
+      console.log('❌ Invalid UUID format:', userId);
       return res.json({
+        version: '1.0.0',
         success: false,
         case: 'ERR_INVALID',
         errorCode: 'INVALID_UUID_FORMAT',
         message: language === 'es' ? 'Formato de UUID inválido' : 'Invalid UUID format',
-        action: 'CLEANUP_LOCALSTORAGE'
+        action: 'CLEANUP_LOCALSTORAGE',
+        webauthn: { action: 'skip' },
+        nextRoute: 'Lobby',
+        uiState: { turn: 0, step: 'intro', counters: { energy: 0 } },
+        playerState: {}
       });
     }
 
-    // Call Flowise to validate user
+    // Call Flowise with correct flow ID and payload transformation
     const flowiseUrl = process.env.FLOWISE_URL || 'http://flowise:3000';
-    const url = `${flowiseUrl}/api/v1/prediction/cdcb7665-5e80-4283-b84f-4d7a080c6044`;
+    const flowId = 'b77e8611-c327-46d9-8a1c-964426675ebe'; // Validation flow ID
+    const url = `${flowiseUrl}/api/v1/prediction/${flowId}`;
 
-    const payload = {
-      question: userId,
+    // Transform frontend payload to Flowise format
+    const flowisePayload = {
+      question: userId, // Send userId as question (empty for validation)
       overrideConfig: {
         userId: userId,
         userLanguage: language
       }
     };
 
-    const response = await axios.post(url, payload, {
-      headers: { 'Content-Type': 'application/json' },
+    console.log('🔧 DEBUG: Sending to Flowise:', {
+      url,
+      payload: flowisePayload
+    });
+
+    const flowiseResponse = await axios.post(url, flowisePayload, {
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.FLOWISE_API_KEY || 'gaXY1T5ZWw5OBnRz8zqItQ1BVwKeEjXhLU7_CmMJ_cg'}`
+      },
       timeout: 30000
     });
 
-    const flowiseData = response.data;
+    console.log('🔧 DEBUG: Flowise response status:', flowiseResponse.status);
+
+    const flowiseData = flowiseResponse.data;
 
     // Parse Flowise response (expected format: { text: "JSON_STRING" })
     let result;
     try {
-      result = JSON.parse(flowiseData.text);
+      result = typeof flowiseData.text === 'string'
+        ? JSON.parse(flowiseData.text)
+        : flowiseData.text || flowiseData;
     } catch (parseError) {
-      console.error('Failed to parse Flowise response:', parseError);
+      console.error('❌ Failed to parse Flowise response:', parseError);
+      console.error('❌ Raw Flowise response:', flowiseData);
+
       return res.status(502).json({
+        version: '1.0.0',
         success: false,
         case: 'ERR_INTERNAL',
-        message: language === 'es' ? 'Error interno del servidor' : 'Internal server error'
+        message: language === 'es' ? 'Error interno del servidor' : 'Internal server error',
+        webauthn: { action: 'skip' },
+        nextRoute: 'Lobby',
+        uiState: { turn: 0, step: 'intro', counters: { energy: 0 } },
+        playerState: {}
       });
     }
 
-    // Handle Flowise response format
+    console.log('🔧 DEBUG: Parsed Flowise result:', result);
+
+    // Handle Flowise response format and transform to frontend format
     if (result.status === 'ERROR') {
+      const errorCase = result.code === 'INVALID_UUID_FORMAT' || result.code === 'CORRUPTED_DATA' ? 'ERR_INVALID' :
+                       result.code === 'USER_NOT_FOUND' ? 'ERR_NOT_FOUND' : 'ERR_INTERNAL';
+
       return res.json({
+        version: '1.0.0',
         success: false,
-        case: result.code === 'INVALID_UUID_FORMAT' || result.code === 'CORRUPTED_DATA' ? 'ERR_INVALID' :
-              result.code === 'USER_NOT_FOUND' ? 'ERR_NOT_FOUND' : 'ERR_INTERNAL',
+        case: errorCase,
         errorCode: result.code,
         message: result.message || (language === 'es' ? 'Error de validación' : 'Validation error'),
-        action: result.action
+        action: result.action,
+        webauthn: { action: 'skip' },
+        nextRoute: 'Lobby',
+        uiState: { turn: 0, step: 'intro', counters: { energy: 0 } },
+        playerState: {}
       });
     }
 
     // Handle success cases
     return res.json({
+      version: '1.0.0',
       success: true,
-      case: result.kind,
+      case: result.kind || 'OK_NEW',
       userId: result.userId,
       proposedUserId: result.proposedUserId,
-      message: result.message || (language === 'es' ? 'Validación exitosa' : 'Validation successful')
+      message: result.message || (language === 'es' ? 'Validación exitosa' : 'Validation successful'),
+      webauthn: result.webauthn || { action: 'skip' },
+      nextRoute: result.nextRoute || 'Lobby',
+      uiState: result.uiState || { turn: 0, step: 'intro', counters: { energy: 0 } },
+      playerState: result.playerState || {}
     });
 
   } catch (error) {
-    console.error('User validation failed:', {
+    console.error('❌ Flowise validation failed:', {
       error: error.message,
-      userId,
-      response: error.response?.data
+      response: error.response?.data,
+      stack: error.stack
     });
 
     if (error.response) {
       return res.status(error.response.status).json({
+        version: '1.0.0',
         success: false,
         case: 'ERR_INTERNAL',
-        message: language === 'es' ? 'Error de servicio externo' : 'External service error'
+        message: language === 'es' ? 'Error de servicio externo' : 'External service error',
+        webauthn: { action: 'skip' },
+        nextRoute: 'Lobby',
+        uiState: { turn: 0, step: 'intro', counters: { energy: 0 } },
+        playerState: {}
       });
     }
 
     return res.status(502).json({
+      version: '1.0.0',
       success: false,
       case: 'ERR_INTERNAL',
-      message: language === 'es' ? 'Servicio de validación temporalmente no disponible' : 'Validation service temporarily unavailable'
+      message: language === 'es' ? 'Servicio de validación temporalmente no disponible' : 'Validation service temporarily unavailable',
+      webauthn: { action: 'skip' },
+      nextRoute: 'Lobby',
+      uiState: { turn: 0, step: 'intro', counters: { energy: 0 } },
+      playerState: {}
     });
   }
 });
