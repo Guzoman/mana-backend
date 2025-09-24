@@ -3,15 +3,14 @@ const axios = require('axios');
 const { z } = require('zod');
 const router = express.Router();
 
-// Schema for frontend payload validation
+// Schema for frontend payload validation - NEW CONTRACT
 const FrontendPayloadSchema = z.object({
-  question: z.any().optional(),
-  variables: z.object({
-    userId: z.string(),
-    language: z.string().default('es'),
-    caps: z.object({
-      webauthn: z.boolean().default(true)
-    }).optional()
+  question: z.string().default(''),
+  overrideConfig: z.object({
+    startState: z.array(z.tuple([
+      z.string(),  // key
+      z.string()   // value
+    ])).optional()
   }).optional()
 });
 
@@ -36,41 +35,32 @@ router.post('/', async (req, res) => {
       });
     }
 
-    const { variables } = validation.data;
-    const userId = variables?.userId || '';
-    const language = variables?.language || 'es';
+    const { overrideConfig } = validation.data;
+    const startState = overrideConfig?.startState || [];
+
+    // Extract userId and userLanguage from startState
+    const userIdEntry = startState.find(([key]) => key === 'userId');
+    const languageEntry = startState.find(([key]) => key === 'userLanguage');
+
+    const userId = userIdEntry ? userIdEntry[1] : '';
+    const language = languageEntry ? languageEntry[1] : 'cat';
 
     console.log('🔧 DEBUG: Received validation request:', { userId, language });
 
-    // Validate UUID format
-    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-    if (userId && !uuidRegex.test(userId)) {
-      console.log('❌ Invalid UUID format:', userId);
-      return res.json({
-        version: '1.0.0',
-        success: false,
-        case: 'ERR_INVALID',
-        errorCode: 'INVALID_UUID_FORMAT',
-        message: language === 'es' ? 'Formato de UUID inválido' : 'Invalid UUID format',
-        action: 'CLEANUP_LOCALSTORAGE',
-        webauthn: { action: 'skip' },
-        nextRoute: 'Lobby',
-        uiState: { turn: 0, step: 'intro', counters: { energy: 0 } },
-        playerState: {}
-      });
-    }
-
-    // Call Flowise with correct flow ID and payload transformation
+    // Call Flowise with NEW CONTRACT - pass through directly
     const flowiseUrl = process.env.FLOWISE_URL || 'http://flowise:3000';
-    const flowId = 'b77e8611-c327-46d9-8a1c-964426675ebe'; // Validation flow ID
+    // TODO: Replace with actual AgentFlow ID when imported
+    const flowId = process.env.AUTH_AGENTFLOW_ID || 'b77e8611-c327-46d9-8a1c-964426675ebe';
     const url = `${flowiseUrl}/api/v1/prediction/${flowId}`;
 
-    // Transform frontend payload to Flowise format
+    // NEW CONTRACT: Pass payload directly to Flowise
     const flowisePayload = {
-      question: userId, // Send userId as question (empty for validation)
+      question: '',
       overrideConfig: {
-        userId: userId,
-        userLanguage: language
+        startState: [
+          ['userId', userId],
+          ['userLanguage', language]
+        ]
       }
     };
 
@@ -91,92 +81,48 @@ router.post('/', async (req, res) => {
 
     const flowiseData = flowiseResponse.data;
 
-    // Parse Flowise response (expected format: { text: "JSON_STRING" })
-    let result;
-    try {
-      result = typeof flowiseData.text === 'string'
-        ? JSON.parse(flowiseData.text)
-        : flowiseData.text || flowiseData;
-    } catch (parseError) {
-      console.error('❌ Failed to parse Flowise response:', parseError);
-      console.error('❌ Raw Flowise response:', flowiseData);
+    // NEW CONTRACT: Flowise DirectReply returns JSON string - pass through without parsing
+    // The AgentFlow already returns the correct format, so we just pass it through
+    console.log('🔧 DEBUG: Flowise response received, passing through directly');
 
-      return res.status(502).json({
-        version: '1.0.0',
-        success: false,
-        case: 'ERR_INTERNAL',
-        message: language === 'es' ? 'Error interno del servidor' : 'Internal server error',
-        webauthn: { action: 'skip' },
-        nextRoute: 'Lobby',
-        uiState: { turn: 0, step: 'intro', counters: { energy: 0 } },
-        playerState: {}
-      });
+    // If flowiseData.text is a string, it's already the correct JSON response
+    if (typeof flowiseData.text === 'string') {
+      // Return the JSON string directly without re-parsing
+      res.type('application/json');
+      return res.send(flowiseData.text);
     }
 
-    console.log('🔧 DEBUG: Parsed Flowise result:', result);
-
-    // Handle Flowise response format and transform to frontend format
-    if (result.status === 'ERROR') {
-      const errorCase = result.code === 'INVALID_UUID_FORMAT' || result.code === 'CORRUPTED_DATA' ? 'ERR_INVALID' :
-                       result.code === 'USER_NOT_FOUND' ? 'ERR_NOT_FOUND' : 'ERR_INTERNAL';
-
-      return res.json({
-        version: '1.0.0',
-        success: false,
-        case: errorCase,
-        errorCode: result.code,
-        message: result.message || (language === 'es' ? 'Error de validación' : 'Validation error'),
-        action: result.action,
-        webauthn: { action: 'skip' },
-        nextRoute: 'Lobby',
-        uiState: { turn: 0, step: 'intro', counters: { energy: 0 } },
-        playerState: {}
-      });
-    }
-
-    // Handle success cases
-    return res.json({
-      version: '1.0.0',
-      success: true,
-      case: result.kind || 'OK_NEW',
-      userId: result.userId,
-      proposedUserId: result.proposedUserId,
-      message: result.message || (language === 'es' ? 'Validación exitosa' : 'Validation successful'),
-      webauthn: result.webauthn || { action: 'skip' },
-      nextRoute: result.nextRoute || 'Lobby',
-      uiState: result.uiState || { turn: 0, step: 'intro', counters: { energy: 0 } },
-      playerState: result.playerState || {}
-    });
+    // Fallback for other response formats
+    return res.json(flowiseData.text || flowiseData);
 
   } catch (error) {
     console.error('❌ Flowise validation failed:', {
       error: error.message,
       response: error.response?.data,
-      stack: error.stack
+      stack: error.stack,
+      code: error.code,
+      timeout: error.timeout
     });
 
-    if (error.response) {
-      return res.status(error.response.status).json({
-        version: '1.0.0',
+    // NEW CONTRACT: Only return 500 for actual network/gateway failures
+    // If Flowise is unreachable or times out, return 500
+    if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND' || error.timeout) {
+      return res.status(502).json({
+        version: '1.0.4',
         success: false,
         case: 'ERR_INTERNAL',
-        message: language === 'es' ? 'Error de servicio externo' : 'External service error',
-        webauthn: { action: 'skip' },
-        nextRoute: 'Lobby',
-        uiState: { turn: 0, step: 'intro', counters: { energy: 0 } },
-        playerState: {}
+        message: 'Flowise service unavailable',
+        timestamp: new Date().toISOString()
       });
     }
 
+    // For other errors (like Flowise returning 500), also return 500
     return res.status(502).json({
-      version: '1.0.0',
+      version: '1.0.4',
       success: false,
       case: 'ERR_INTERNAL',
-      message: language === 'es' ? 'Servicio de validación temporalmente no disponible' : 'Validation service temporarily unavailable',
-      webauthn: { action: 'skip' },
-      nextRoute: 'Lobby',
-      uiState: { turn: 0, step: 'intro', counters: { energy: 0 } },
-      playerState: {}
+      message: 'Gateway error',
+      timestamp: new Date().toISOString()
     });
   }
 });

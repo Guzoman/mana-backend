@@ -39,6 +39,7 @@ services:
       TOOL_FUNCTION_EXTERNAL_DEP: "axios,pg,@getzep/zep-js"
       LOG_PATH: "/root/.flowise/logs"
       DISABLE_FLOWISE_TELEMETRY: "true"
+      DATABASE_PASSWORD: "${DATABASE_PASSWORD}"
     volumes:
       - flowise_data:/root/.flowise
     expose:
@@ -71,6 +72,7 @@ services:
       DATABASE_PASSWORD: "${DATABASE_PASSWORD}"
       DATABASE_SSL: "false"
       FLOWISE_URL: "http://flowise:3001"
+      AUTH_AGENTFLOW_ID: "b77e8611-c327-46d9-8a1c-964426675ebe"
       DEFAULT_CHATFLOW_ID: "b77e8611-c327-46d9-8a1c-964426675ebe"
       CORS_ORIGINS: "https://manaproject.app,https://www.manaproject.app"
     expose:

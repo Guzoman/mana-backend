@@ -88,6 +88,7 @@ app.locals.config = {
   jwtTtl: process.env.JWT_TTL || '3600',
   flowiseUrl: process.env.FLOWISE_URL || 'http://flowise:3000',
   flowiseApiKey: process.env.FLOWISE_API_KEY,
+  authAgentflowId: process.env.AUTH_AGENTFLOW_ID || 'b77e8611-c327-46d9-8a1c-964426675ebe',
   rpId: process.env.RP_ID || 'manaproject.app',
   origin: process.env.ORIGIN || 'https://manaproject.app'
 };
