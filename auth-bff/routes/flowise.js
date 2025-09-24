@@ -51,15 +51,15 @@ router.post('/', async (req, res) => {
     const flowiseUrl = process.env.FLOWISE_URL || 'http://flowise:3001';
     // TODO: Replace with actual AgentFlow ID when imported
     const flowId = process.env.AUTH_AGENTFLOW_ID || 'b77e8611-c327-46d9-8a1c-964426675ebe';
-    const url = `${flowiseUrl}/api/v1/agentflow/prediction/${flowId}`;
+    const url = `${flowiseUrl}/api/v1/prediction/${flowId}`;
 
     // NEW CONTRACT: Pass payload directly to Flowise
     const flowisePayload = {
-      question: '',
+      question: '', // SIEMPRE string vacío, nunca undefined/null
       overrideConfig: {
         startState: [
-          ['userId', userId],
-          ['userLanguage', language]
+          ['userId', userId || ''], // Asegurar que nunca sea undefined
+          ['userLanguage', language || 'es'] // Asegurar que nunca sea undefined
         ]
       }
     };
