@@ -48,10 +48,10 @@ router.post('/', async (req, res) => {
     console.log('🔧 DEBUG: Received validation request:', { userId, language });
 
     // Call Flowise with NEW CONTRACT - pass through directly
-    const flowiseUrl = process.env.FLOWISE_URL || 'http://flowise:3000';
+    const flowiseUrl = process.env.FLOWISE_URL || 'http://flowise:3001';
     // TODO: Replace with actual AgentFlow ID when imported
     const flowId = process.env.AUTH_AGENTFLOW_ID || 'b77e8611-c327-46d9-8a1c-964426675ebe';
-    const url = `${flowiseUrl}/api/v1/prediction/${flowId}`;
+    const url = `${flowiseUrl}/api/v1/agentflow/prediction/${flowId}`;
 
     // NEW CONTRACT: Pass payload directly to Flowise
     const flowisePayload = {
@@ -72,7 +72,8 @@ router.post('/', async (req, res) => {
     const flowiseResponse = await axios.post(url, flowisePayload, {
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.FLOWISE_API_KEY || 'gaXY1T5ZWw5OBnRz8zqItQ1BVwKeEjXhLU7_CmMJ_cg'}`
+        'Authorization': `Bearer ${process.env.FLOWISE_API_KEY || 'gaXY1T5ZWw5OBnRz8zqItQ1BVwKeEjXhLU7_CmMJ_cg'}`,
+        'x-api-key': process.env.FLOWISE_API_KEY || 'gaXY1T5ZWw5OBnRz8zqItQ1BVwKeEjXhLU7_CmMJ_cg'
       },
       timeout: 30000
     });
