@@ -152,12 +152,64 @@ const ShareChatSchema = z.object({
 
 // Health endpoint
 app.get('/health', (req, res) => {
-  res.status(200).json({ 
-    ok: true, 
+  res.status(200).json({
+    ok: true,
     service: 'mana-auth-bff',
     timestamp: new Date().toISOString(),
     version: '1.0.0'
   });
+});
+
+// Diagnostic endpoint - test Flowise connectivity
+app.get('/diag', async (req, res) => {
+  try {
+    const FLOWISE_URL = app.locals.config.flowiseUrl || 'http://flowise:3001';
+    const AUTH_AGENTFLOW_ID = app.locals.config.authAgentflowId || 'b77e8611-c327-46d9-8a1c-964426675ebe';
+    const FLOWISE_API_KEY = app.locals.config.flowiseApiKey;
+
+    const url = `${FLOWISE_URL}/api/v1/agentflow/prediction/${AUTH_AGENTFLOW_ID}`;
+    const headers = {
+      'Content-Type': 'application/json',
+    };
+
+    if (FLOWISE_API_KEY) {
+      headers['x-api-key'] = FLOWISE_API_KEY;
+      headers['Authorization'] = `Bearer ${FLOWISE_API_KEY}`;
+    }
+
+    const payload = {
+      question: '',
+      overrideConfig: {
+        startState: [['userId','health'],['userLanguage','es']]
+      }
+    };
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    });
+
+    const text = await response.text();
+
+    res.status(200).json({
+      ok: response.ok,
+      status: response.status,
+      statusText: response.statusText,
+      responseLength: text.length,
+      flowiseUrl: FLOWISE_URL,
+      hasApiKey: !!FLOWISE_API_KEY,
+      headers: Object.keys(headers),
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: String(error),
+      message: 'Flowise connection failed',
+      timestamp: new Date().toISOString()
+    });
+  }
 });
 
 // Echo endpoint for testing

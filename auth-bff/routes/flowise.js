@@ -69,16 +69,27 @@ router.post('/', async (req, res) => {
       payload: flowisePayload
     });
 
+    // Prepare headers with both authentication methods
+    const headers = {
+      'Content-Type': 'application/json',
+    };
+
+    // Add both authentication headers if API key is available
+    const flowiseApiKey = process.env.FLOWISE_API_KEY || 'gaXY1T5ZWw5OBnRz8zqItQ1BVwKeEjXhLU7_CmMJ_cg';
+    if (flowiseApiKey) {
+      headers['x-api-key'] = flowiseApiKey;
+      headers['Authorization'] = `Bearer ${flowiseApiKey}`;
+    }
+
     const flowiseResponse = await axios.post(url, flowisePayload, {
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.FLOWISE_API_KEY || 'gaXY1T5ZWw5OBnRz8zqItQ1BVwKeEjXhLU7_CmMJ_cg'}`,
-        'x-api-key': process.env.FLOWISE_API_KEY || 'gaXY1T5ZWw5OBnRz8zqItQ1BVwKeEjXhLU7_CmMJ_cg'
-      },
+      headers,
       timeout: 30000
     });
 
     console.log('🔧 DEBUG: Flowise response status:', flowiseResponse.status);
+    console.log('🔧 DEBUG: Flowise www-authenticate:', flowiseResponse.headers['www-authenticate']);
+    console.log('🔧 DEBUG: Flowise server header:', flowiseResponse.headers['server']);
+    console.log('🔧 DEBUG: Flowise response headers:', Object.keys(flowiseResponse.headers));
 
     const flowiseData = flowiseResponse.data;
 
