@@ -7,10 +7,7 @@ const router = express.Router();
 const FrontendPayloadSchema = z.object({
   question: z.string().default(''),
   overrideConfig: z.object({
-    startState: z.array(z.tuple([
-      z.string(),  // key
-      z.string()   // value
-    ])).optional()
+    variables: z.record(z.string()).optional()
   }).optional()
 });
 
@@ -36,31 +33,28 @@ router.post('/', async (req, res) => {
     }
 
     const { overrideConfig } = validation.data;
-    const startState = overrideConfig?.startState || [];
+    const variables = overrideConfig?.variables || {};
 
-    // Extract userId and userLanguage from startState
-    const userIdEntry = startState.find(([key]) => key === 'userId');
-    const languageEntry = startState.find(([key]) => key === 'userLanguage');
-
-    const userId = userIdEntry ? userIdEntry[1] : '';
-    const language = languageEntry ? languageEntry[1] : 'cat';
+    // Extract userId and userLanguage from variables
+    const userId = variables.userId || '';
+    const language = variables.userLanguage || 'cat';
 
     console.log('🔧 DEBUG: Received validation request:', { userId, language });
 
     // Call Flowise with NEW CONTRACT - pass through directly
     const flowiseUrl = process.env.FLOWISE_URL || 'http://flowise:3001';
     // TODO: Replace with actual AgentFlow ID when imported
-    const flowId = process.env.AUTH_AGENTFLOW_ID || 'b77e8611-c327-46d9-8a1c-964426675ebe';
-    const url = `${flowiseUrl}/api/v1/prediction/${flowId}`;
+    const flowId = process.env.AUTH_AGENTFLOW_ID || '6e6088ac-e323-46de-acbb-67884fd57f2a';
+    const url = `${flowiseUrl}/prediction/${flowId}`;
 
     // NEW CONTRACT: Pass payload directly to Flowise
     const flowisePayload = {
       question: '', // SIEMPRE string vacío, nunca undefined/null
       overrideConfig: {
-        startState: [
-          ['userId', userId || ''], // Asegurar que nunca sea undefined
-          ['userLanguage', language || 'es'] // Asegurar que nunca sea undefined
-        ]
+        variables: {
+          userId: userId || '', // Asegurar que nunca sea undefined
+          userLanguage: language || 'es' // Asegurar que nunca sea undefined
+        }
       }
     };
 

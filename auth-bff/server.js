@@ -81,6 +81,12 @@ app.use(express.json({ limit: '1mb' }));
 app.options('/api/*', cors(corsOptions));
 app.use('/api', cors(corsOptions));
 
+// CORS para endpoints principales
+app.options('/hola', cors(corsOptions));
+app.options('/forbff', cors(corsOptions));
+app.use('/hola', cors(corsOptions));
+app.use('/forbff', cors(corsOptions));
+
 // Store pool and config in app.locals for routes
 app.locals.pool = pool;
 app.locals.config = {
@@ -167,7 +173,7 @@ app.get('/diag', async (req, res) => {
     const AUTH_AGENTFLOW_ID = app.locals.config.authAgentflowId || 'b77e8611-c327-46d9-8a1c-964426675ebe';
     const FLOWISE_API_KEY = app.locals.config.flowiseApiKey;
 
-    const url = `${FLOWISE_URL}/api/v1/agentflow/prediction/${AUTH_AGENTFLOW_ID}`;
+    const url = `${FLOWISE_URL}/prediction/${AUTH_AGENTFLOW_ID}`;
     const headers = {
       'Content-Type': 'application/json',
     };
@@ -490,6 +496,70 @@ app.get('/api/chat/:shareId', async (req, res) => {
     });
   }
 });
+
+// Handler único para /hola y /forbff
+async function handleAuth(req, res) {
+  try {
+    console.log('📨 INCOMING REQUEST:', {
+      method: req.method,
+      path: req.path,
+      body: req.body,
+      headers: req.headers['content-type']
+    });
+    
+    const { question, userId, userLanguage } = req.body || {};
+    console.log('📋 EXTRACTED VALUES:', { question, userId, userLanguage });
+    
+    const q = (typeof question === 'string' && question.trim().length) ? question : 'boot';
+    console.log('✅ FINAL QUESTION:', q);
+
+    const flowisePayload = {
+      question: q,
+      overrideConfig: {
+        vars: { userId, userLanguage }
+      },
+      streaming: false
+    };
+
+    console.log('→ Enviando a Flowise:', JSON.stringify(flowisePayload));
+
+    const CHATFLOW_ID = process.env.CHATFLOW_ID || process.env.AUTH_AGENTFLOW_ID || 'b77e8611-c327-46d9-8a1c-964426675ebe';
+    const FLOWISE_URL = process.env.FLOWISE_URL || 'http://flowise:3001';
+    const url = `${FLOWISE_URL}/api/v1/prediction/${CHATFLOW_ID}`;
+
+    const response = await axios.post(url, flowisePayload, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 15000
+    });
+
+    const data = response.data;
+
+    // ACEPTAR texto u objeto (no parsear a la fuerza)
+    if (typeof data === 'string') {
+      return res.status(200).json({ ok: true, case: 'OK', text: data });
+    }
+    if (data && typeof data === 'object') {
+      return res.status(200).json({ ok: true, case: 'OK', data });
+    }
+
+    return res.status(502).json({
+      ok: false,
+      case: 'ERR_GATEWAY',
+      message: 'Unexpected response type from upstream'
+    });
+  } catch (err) {
+    console.error('Auth error:', err?.response?.status, err?.response?.data || err.message);
+    return res.status(500).json({
+      ok: false,
+      case: 'ERR_INTERNAL',
+      message: 'AuthBFF error'
+    });
+  }
+}
+
+// Endpoints usando el handler compartido
+app.post('/forbff', handleAuth);
+app.post('/hola', handleAuth);
 
 // Public Flowise API endpoint (no auth required)
 const flowiseRouter = require('./routes/flowise');
