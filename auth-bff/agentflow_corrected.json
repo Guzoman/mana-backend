@@ -1,0 +1,445 @@
+{
+  "nodes": [
+    {
+      "id": "customFunctionAgentflow_0",
+      "type": "agentFlow",
+      "position": {
+        "x": 274,
+        "y": 50
+      },
+      "data": {
+        "id": "customFunctionAgentflow_0",
+        "label": "Load User Data (PG)",
+        "version": 1,
+        "name": "customFunctionAgentflow",
+        "type": "CustomFunction",
+        "color": "#E4B7FF",
+        "baseClasses": [
+          "CustomFunction"
+        ],
+        "category": "Agent Flows",
+        "description": "Resuelve 4 casos; crea usuario en OK_NEW; NodeVM safe; devuelve string JSON",
+        "inputParams": [
+          {
+            "label": "Input Variables",
+            "name": "customFunctionInputVariables",
+            "description": "Variables de entrada para el procesamiento",
+            "type": "array",
+            "optional": true,
+            "acceptVariable": true,
+            "array": [
+              {
+                "label": "Variable Name",
+                "name": "variableName",
+                "type": "string"
+              },
+              {
+                "label": "Variable Value",
+                "name": "variableValue",
+                "type": "string",
+                "acceptVariable": true
+              }
+            ],
+            "id": "customFunctionAgentflow_0-input-customFunctionInputVariables-array",
+            "display": true
+          },
+          {
+            "label": "Javascript Function",
+            "name": "customFunctionJavascriptFunction",
+            "type": "code",
+            "description": "Función LUD con creación en PG y timeouts",
+            "id": "customFunctionAgentflow_0-input-customFunctionJavascriptFunction-code",
+            "display": true
+          },
+          {
+            "label": "Update Flow State",
+            "name": "customFunctionUpdateState",
+            "description": "Actualizar estado del flujo (no usado; NodeVM readonly)",
+            "type": "array",
+            "optional": true,
+            "acceptVariable": true,
+            "array": [
+              {
+                "label": "Key",
+                "name": "key",
+                "type": "asyncOptions",
+                "loadMethod": "listRuntimeStateKeys",
+                "freeSolo": true
+              },
+              {
+                "label": "Value",
+                "name": "value",
+                "type": "string",
+                "acceptVariable": true,
+                "acceptNodeOutputAsVariable": true
+              }
+            ],
+            "id": "customFunctionAgentflow_0-input-customFunctionUpdateState-array",
+            "display": true
+          }
+        ],
+        "inputAnchors": [],
+        "inputs": {
+          "customFunctionInputVariables": [],
+          "customFunctionJavascriptFunction": "// Load User Data — PostgreSQL REAL con UUID generado en Node\nconst { Pool } = require('pg');\n\n// GUARDA SOLO LA UUID (string) EN EL STATE\nfunction putUuidInState(uuid) {\n  try { $flow.state.userId = (typeof uuid === 'string') ? uuid : ''; }\n  catch { $flow.state.userId = ''; }\n}\n\nfunction normalizeLang(x) {\n  const s = String(x || 'en').toLowerCase();\n  if (s === 'cat') return 'ca';\n  if (s.startsWith('es')) return 'es';\n  if (s.startsWith('en')) return 'en';\n  return s;\n}\n\nfunction validUUID(v) {\n  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);\n}\n\nfunction fakeUuid() {\n  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {\n    const r = Math.random() * 16 | 0;\n    const v = c == 'x' ? r : (r & 0x3 | 0x8);\n    return v.toString(16);\n  });\n}\n\n// Configuración PostgreSQL desde variables de entorno o $vars\nconst pgConfig = {\n  host: $vars?.PGHOST || 'mana-pg',\n  port: Number($vars?.PGPORT || 5432),\n  user: $vars?.PGUSER || 'mana',\n  password: $vars?.PGPASSWORD || '',\n  database: $vars?.PGDATABASE || 'mana',\n  ssl: ($vars?.PGSSLMODE === 'require') ? { rejectUnauthorized: false } : false,\n  max: 2,\n  idleTimeoutMillis: 5000\n};\n\nconst lang = normalizeLang($vars?.userLanguage);\nconst userIdIn = String($vars?.userId || '').trim();\nconst BYPASS_DB = String($vars?.BYPASS_DB || '0') === '1';\n\nconsole.log('🔧 LUD: Iniciando PostgreSQL real con userId=', userIdIn, 'lang=', lang, 'BYPASS=', BYPASS_DB);\nconsole.log('🔧 LUD: Config PG - host:', pgConfig.host, 'port:', pgConfig.port, 'db:', pgConfig.database);\n\n// Si BYPASS_DB está activado, usar modo simulado\nif (BYPASS_DB) {\n  console.log('🔧 LUD: MODO BYPASS_DB activado');\n  if (!userIdIn) {\n    const newId = fakeUuid();\n    putUuidInState(newId);\n    return { case: 'OK_NEW', userId: '', nextUserId: newId, finalUserId: newId, isAuthenticated: true, isNewUser: true, isReturningUser: false, language: lang };\n  } else if (!validUUID(userIdIn)) {\n    putUuidInState('');\n    return { case: 'ERR_INVALID', userId: userIdIn, finalUserId: userIdIn, isAuthenticated: false, error: 'INVALID_UUID' };\n  } else {\n    putUuidInState(userIdIn);\n    return { case: 'OK_KNOWN', userId: userIdIn, finalUserId: userIdIn, isAuthenticated: true, isNewUser: false, isReturningUser: true, language: lang, stats: { saves: 0, level: 1 } };\n  }\n}\n\n// Modo PostgreSQL REAL\nconst pool = new Pool(pgConfig);\n\nasync function main() {\n  try {\n    // Caso 1: userId vacío → OK_NEW (crear usuario)\n    if (!userIdIn) {\n      console.log('🔧 LUD: Caso OK_NEW - creando usuario en PostgreSQL');\n      const client = await pool.connect();\n      try {\n        await client.query('BEGIN');\n        // Generar UUID en Node en lugar de gen_random_uuid()\n        const newId = fakeUuid();\n        const etag = fakeUuid(); // Generar etag para evitar NOT NULL constraint\n        const insertResult = await client.query(\n          `INSERT INTO users (id, email, email_verified, created_at)\n           VALUES ($1, NULL, false, NOW())\n           RETURNING id`,\n          [newId]\n        );\n        \n        await client.query(\n          `INSERT INTO player_saves (user_id, slot, payload, etag, created_at)\n           VALUES ($1, 1, '{}'::jsonb, $2, NOW())`,\n          [newId, etag]\n        );\n        \n        await client.query('COMMIT');\n        console.log('🔧 LUD: Usuario creado exitosamente:', newId);\n        \n        putUuidInState(newId);\n        return {\n          case: 'OK_NEW',\n          userId: '',\n          nextUserId: newId,\n          finalUserId: newId,\n          isAuthenticated: true,\n          isNewUser: true,\n          isReturningUser: false,\n          language: lang\n        };\n      } catch (e) {\n        await client.query('ROLLBACK');\n        console.error('🔧 LUD: Error creando usuario:', e.message);\n        putUuidInState('');\n        return { case: 'ERR_DB', userId: '', isAuthenticated: false, error: 'CREATE_USER_FAILED', detail: e.message };\n      } finally {\n        client.release();\n      }\n    }\n    \n    // Caso 2: UUID inválido → ERR_INVALID\n    if (!validUUID(userIdIn)) {\n      console.log('🔧 LUD: Caso ERR_INVALID - UUID inválido:', userIdIn);\n      putUuidInState('');\n      return {\n        case: 'ERR_INVALID',\n        userId: userIdIn,\n        finalUserId: userIdIn,\n        isAuthenticated: false,\n        error: 'INVALID_UUID'\n      };\n    }\n    \n    // Caso 3: Verificar si usuario existe\n    console.log('🔧 LUD: Verificando existencia de usuario:', userIdIn);\n    const existsResult = await pool.query(\n      `SELECT id FROM users WHERE id = $1 LIMIT 1`,\n      [userIdIn]\n    );\n    \n    const userExists = existsResult.rows.length > 0;\n    \n    // Caso 4: UUID válido pero no existe → ERR_NOT_FOUND\n    if (!userExists) {\n      console.log('🔧 LUD: Caso ERR_NOT_FOUND - Usuario no existe:', userIdIn);\n      putUuidInState('');\n      return {\n        case: 'ERR_NOT_FOUND',\n        userId: userIdIn,\n        finalUserId: userIdIn,\n        isAuthenticated: false,\n        error: 'USER_NOT_FOUND'\n      };\n    }\n    \n    // Caso 5: OK_KNOWN - Usuario existe, obtener stats\n    console.log('🔧 LUD: Caso OK_KNOWN - Usuario existe:', userIdIn);\n    let stats = null;\n    try {\n      const statsResult = await pool.query(\n        `SELECT COUNT(*)::int AS saves FROM player_saves WHERE user_id = $1`,\n        [userIdIn]\n      );\n      stats = {\n        saves: statsResult.rows[0]?.saves || 0,\n        level: 1\n      };\n    } catch (e) {\n      console.warn('🔧 LUD: No se pudieron obtener stats:', e.message);\n      stats = { saves: 0, level: 1 };\n    }\n    \n    putUuidInState(userIdIn);\n    return {\n      case: 'OK_KNOWN',\n      userId: userIdIn,\n      finalUserId: userIdIn,\n      isAuthenticated: true,\n      isNewUser: false,\n      isReturningUser: true,\n      language: lang,\n      stats: stats\n    };\n    \n  } catch (e) {\n    console.error('🔧 LUD: Error general en PostgreSQL:', e.message);\n    putUuidInState('');\n    return {\n      case: 'ERR_DB',\n      userId: userIdIn,\n      finalUserId: userIdIn,\n      isAuthenticated: false,\n      error: 'DB_CONNECTION_ERROR',\n      detail: e.message\n    };\n  } finally {\n    await pool.end().catch(() => {});\n  }\n}\n\nreturn main();\n",
+          "customFunctionUpdateState": [],
+          "undefined": ""
+        },
+        "outputAnchors": [
+          {
+            "id": "customFunctionAgentflow_0-output-customFunctionAgentflow",
+            "label": "Custom Function",
+            "name": "customFunctionAgentflow"
+          }
+        ],
+        "outputs": {},
+        "selected": false
+      },
+      "width": 204,
+      "height": 66,
+      "positionAbsolute": {
+        "x": 274,
+        "y": 50
+      },
+      "selected": false,
+      "dragging": false
+    },
+    {
+      "id": "startAgentflow_0",
+      "position": {
+        "x": -17.75,
+        "y": 17.375
+      },
+      "data": {
+        "id": "startAgentflow_0",
+        "label": "Start",
+        "version": 1.1,
+        "name": "startAgentflow",
+        "type": "Start",
+        "color": "#7EE787",
+        "hideInput": true,
+        "baseClasses": [
+          "Start"
+        ],
+        "category": "Agent Flows",
+        "description": "Starting point of the agentflow",
+        "inputParams": [
+          {
+            "label": "Input Type",
+            "name": "startInputType",
+            "type": "options",
+            "options": [
+              {
+                "label": "Chat Input",
+                "name": "chatInput",
+                "description": "Start the conversation with chat input"
+              },
+              {
+                "label": "Form Input",
+                "name": "formInput",
+                "description": "Start the workflow with form inputs"
+              }
+            ],
+            "default": "chatInput",
+            "id": "startAgentflow_0-input-startInputType-options",
+            "display": true
+          },
+          {
+            "label": "Form Title",
+            "name": "formTitle",
+            "type": "string",
+            "placeholder": "Please Fill Out The Form",
+            "show": {
+              "startInputType": "formInput"
+            },
+            "id": "startAgentflow_0-input-formTitle-string",
+            "display": false
+          },
+          {
+            "label": "Form Description",
+            "name": "formDescription",
+            "type": "string",
+            "placeholder": "Complete all fields below to continue",
+            "show": {
+              "startInputType": "formInput"
+            },
+            "id": "startAgentflow_0-input-formDescription-string",
+            "display": false
+          },
+          {
+            "label": "Form Input Types",
+            "name": "formInputTypes",
+            "description": "Specify the type of form input",
+            "type": "array",
+            "show": {
+              "startInputType": "formInput"
+            },
+            "array": [
+              {
+                "label": "Type",
+                "name": "type",
+                "type": "options",
+                "options": [
+                  {
+                    "label": "String",
+                    "name": "string"
+                  },
+                  {
+                    "label": "Number",
+                    "name": "number"
+                  },
+                  {
+                    "label": "Boolean",
+                    "name": "boolean"
+                  },
+                  {
+                    "label": "Options",
+                    "name": "options"
+                  }
+                ],
+                "default": "string"
+              },
+              {
+                "label": "Label",
+                "name": "label",
+                "type": "string",
+                "placeholder": "Label for the input"
+              },
+              {
+                "label": "Variable Name",
+                "name": "name",
+                "type": "string",
+                "placeholder": "Variable name for the input (must be camel case)",
+                "description": "Variable name must be camel case. For example: firstName, lastName, etc."
+              },
+              {
+                "label": "Add Options",
+                "name": "addOptions",
+                "type": "array",
+                "show": {
+                  "formInputTypes[$index].type": "options"
+                },
+                "array": [
+                  {
+                    "label": "Option",
+                    "name": "option",
+                    "type": "string"
+                  }
+                ]
+              }
+            ],
+            "id": "startAgentflow_0-input-formInputTypes-array",
+            "display": false
+          },
+          {
+            "label": "Ephemeral Memory",
+            "name": "startEphemeralMemory",
+            "type": "boolean",
+            "description": "Start fresh for every execution without past chat history",
+            "optional": true,
+            "id": "startAgentflow_0-input-startEphemeralMemory-boolean",
+            "display": true
+          },
+          {
+            "label": "Flow State",
+            "name": "startState",
+            "description": "Runtime state during the execution of the workflow",
+            "type": "array",
+            "optional": true,
+            "array": [
+              {
+                "label": "Key",
+                "name": "key",
+                "type": "string",
+                "placeholder": "Foo"
+              },
+              {
+                "label": "Value",
+                "name": "value",
+                "type": "string",
+                "placeholder": "Bar",
+                "optional": true
+              }
+            ],
+            "id": "startAgentflow_0-input-startState-array",
+            "display": true
+          },
+          {
+            "label": "Persist State",
+            "name": "startPersistState",
+            "type": "boolean",
+            "description": "Persist the state in the same session",
+            "optional": true,
+            "id": "startAgentflow_0-input-startPersistState-boolean",
+            "display": true
+          }
+        ],
+        "inputAnchors": [],
+        "inputs": {
+          "startInputType": "chatInput",
+          "formTitle": "",
+          "formDescription": "",
+          "formInputTypes": "",
+          "startEphemeralMemory": "",
+          "startState": [
+            {
+              "key": "userId",
+              "value": ""
+            }
+          ],
+          "startPersistState": ""
+        },
+        "outputAnchors": [
+          {
+            "id": "startAgentflow_0-output-startAgentflow",
+            "label": "Start",
+            "name": "startAgentflow"
+          }
+        ],
+        "outputs": {},
+        "selected": false
+      },
+      "type": "agentFlow",
+      "width": 103,
+      "height": 66,
+      "positionAbsolute": {
+        "x": -17.75,
+        "y": 17.375
+      },
+      "selected": false,
+      "dragging": false
+    },
+    {
+      "id": "customFunctionAgentflow_1",
+      "position": {
+        "x": 605.3566717816593,
+        "y": 63.94296601133411
+      },
+      "data": {
+        "id": "customFunctionAgentflow_1",
+        "label": "Router",
+        "version": 1,
+        "name": "customFunctionAgentflow",
+        "type": "CustomFunction",
+        "color": "#E4B7FF",
+        "baseClasses": [
+          "CustomFunction"
+        ],
+        "category": "Agent Flows",
+        "description": "Router node to handle NextRoute assignment based on user validation case - reads from flow state",
+        "inputParams": [
+          {
+            "label": "Input Variables",
+            "name": "customFunctionInputVariables",
+            "description": "Input variables can be used in the function with prefix $. For example: $foo",
+            "type": "array",
+            "optional": true,
+            "acceptVariable": true,
+            "array": [
+              {
+                "label": "Variable Name",
+                "name": "variableName",
+                "type": "string"
+              },
+              {
+                "label": "Variable Value",
+                "name": "variableValue",
+                "type": "string",
+                "acceptVariable": true
+              }
+            ],
+            "id": "customFunctionAgentflow_1-input-customFunctionInputVariables-array",
+            "display": true
+          },
+          {
+            "label": "Javascript Function",
+            "name": "customFunctionJavascriptFunction",
+            "type": "code",
+            "codeExample": "/*\n* You can use any libraries imported in Flowise\n* You can use properties specified in Input Variables with the prefix $. For example: $foo\n* You can get default flow config: $flow.sessionId, $flow.chatId, $flow.chatflowId, $flow.input, $flow.state\n* You can get global variables: $vars.<variable-name>\n* Must return a string value at the end of function\n*/\n\nconst fetch = require('node-fetch');\nconst url = 'https://api.open-meteo.com/v1/forecast?latitude=52.52&longitude=13.41&current_weather=true';\nconst options = {\n    method: 'GET',\n    headers: {\n        'Content-Type': 'application/json'\n    }\n};\ntry {\n    const response = await fetch(url, options);\n    const text = await response.text();\n    return text;\n} catch (error) {\n    console.error(error);\n    return '';\n}",
+            "description": "The function to execute. Must return a string or an object that can be converted to a string.",
+            "id": "customFunctionAgentflow_1-input-customFunctionJavascriptFunction-code",
+            "display": true
+          },
+          {
+            "label": "Update Flow State",
+            "name": "customFunctionUpdateState",
+            "description": "Update runtime state during the execution of the workflow",
+            "type": "array",
+            "optional": true,
+            "acceptVariable": true,
+            "array": [
+              {
+                "label": "Key",
+                "name": "key",
+                "type": "asyncOptions",
+                "loadMethod": "listRuntimeStateKeys",
+                "freeSolo": true
+              },
+              {
+                "label": "Value",
+                "name": "value",
+                "type": "string",
+                "acceptVariable": true,
+                "acceptNodeOutputAsVariable": true
+              }
+            ],
+            "id": "customFunctionAgentflow_1-input-customFunctionUpdateState-array",
+            "display": true
+          }
+        ],
+        "inputAnchors": [],
+        "inputs": {
+          "customFunctionInputVariables": [],
+          "customFunctionJavascriptFunction": "// Router — lee UUID de $flow.state.userId, consulta BD por 'route' y devuelve STRING JSON\nconst { Pool } = require('pg');\n\nfunction validUUID(v) {\n  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);\n}\n\nfunction safeIdent(s, def) {\n  const v = String(s || def || '').trim();\n  if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(v)) return String(def || '');\n  return v;\n}\n\nconst BYPASS = String($vars?.BYPASS_DB || '0') === '1';\nconst rawId = $flow.state.userId;\nlet userId = typeof rawId === 'string' ? rawId.trim() : '';\n\n// Compat: si el state contiene JSON serializado, extrae la UUID\nif (userId && userId.startsWith('{')) {\n  try {\n    const obj = JSON.parse(userId);\n    const cand = (obj && (obj.finalUserId || obj.userId)) ? String(obj.finalUserId || obj.userId) : '';\n    userId = cand.trim();\n  } catch { /* sigue y fallará la validación si no es parseable */ }\n}\n\n// Validación UUID\nif (!userId || !validUUID(userId)) {\n  const out = {\n    routingDecision: {\n      case: 'ERR_INVALID', userId, finalUserId: userId,\n      nextRoute: 'Error', isAuthenticated: false, isNewUser: false, isReturningUser: false,\n      action: 'SHOW_ERROR', error: 'INVALID_UUID',\n      routeData: { errorMessage: 'ID inválido', errorAction: 'CLEAR_LOCALSTORAGE' }\n    },\n    nextRoute: 'Error', isAuthenticated: false, userId, case: 'ERR_INVALID',\n    action: 'SHOW_ERROR', error: 'INVALID_UUID',\n    routeData: { errorMessage: 'ID inválido', errorAction: 'CLEAR_LOCALSTORAGE' },\n    timestamp: new Date().toISOString()\n  };\n  return JSON.stringify(out);\n}\n\n// Modo bypass\nif (BYPASS) {\n  const route = ($vars?.MOCK_ROUTE || 'Lobby').toString();\n  const isNew = String($vars?.MOCK_NEW || '0') === '1' || route === 'Lobby';\n  const decision = {\n    case: isNew ? 'OK_NEW' : 'OK_KNOWN', userId, finalUserId: userId,\n    nextRoute: route, isAuthenticated: true, isNewUser: isNew, isReturningUser: !isNew,\n    action: route === 'Lobby' ? 'GO_LOBBY' : 'GO_' + route.toUpperCase(),\n    routeData: {}\n  };\n  return JSON.stringify({ routingDecision: decision, nextRoute: decision.nextRoute, isAuthenticated: decision.isAuthenticated, userId: decision.finalUserId, case: decision.case, action: decision.action, error: null, routeData: decision.routeData, timestamp: new Date().toISOString() });\n}\n\n// Consulta a BD\nconst table = safeIdent($vars?.ROUTE_TABLE, 'users');\nconst col = safeIdent($vars?.ROUTE_COLUMN, 'route');\nconst sql = `SELECT ${col} AS route FROM ${table} WHERE id = $1 LIMIT 1`;\n\nconst pgConfig = {\n  host: process.env.PGHOST || $vars.PGHOST || 'localhost',\n  port: Number(process.env.PGPORT || $vars.PGPORT || 5432),\n  user: process.env.PGUSER || $vars.PGUSER || 'postgres',\n  password: process.env.PGPASSWORD || $vars.PGPASSWORD || '',\n  database: process.env.PGDATABASE || $vars.PGDATABASE || 'postgres',\n  ssl: (process.env.PGSSLMODE || $vars.PGSSLMODE || 'disable') !== 'disable',\n  max: 2,\n  idleTimeoutMillis: 5000\n};\n\nconst pool = new Pool(pgConfig);\n\nlet row;\ntry {\n  const result = await pool.query(sql, [userId]);\n  row = result.rows?.[0] || null;\n} catch (e) {\n  await pool.end().catch(() => {});\n  const out = {\n    routingDecision: {\n      case: 'ERR_DB', userId, finalUserId: userId,\n      nextRoute: 'Error', isAuthenticated: false, isNewUser: false, isReturningUser: false,\n      action: 'SHOW_ERROR', error: 'DATABASE_ERROR',\n      routeData: { errorMessage: 'DB error', errorAction: 'RETRY', detail: String(e.message || e) }\n    },\n    nextRoute: 'Error', isAuthenticated: false, userId, case: 'ERR_DB',\n    action: 'SHOW_ERROR', error: 'DATABASE_ERROR', routeData: { errorMessage: 'DB error', errorAction: 'RETRY', detail: String(e.message || e) }, timestamp: new Date().toISOString()\n  };\n  return JSON.stringify(out);\n} finally {\n  await pool.end().catch(() => {});\n}\n\nif (!row) {\n  const out = {\n    routingDecision: {\n      case: 'ERR_NOT_FOUND', userId, finalUserId: userId,\n      nextRoute: 'Error', isAuthenticated: false, isNewUser: false, isReturningUser: false,\n      action: 'SHOW_ERROR', error: 'USER_NOT_FOUND',\n      routeData: { errorMessage: 'Usuario no encontrado', errorAction: 'CLEAR_LOCALSTORAGE' }\n    },\n    nextRoute: 'Error', isAuthenticated: false, userId, case: 'ERR_NOT_FOUND', action: 'SHOW_ERROR', error: 'USER_NOT_FOUND', routeData: { errorMessage: 'Usuario no encontrado', errorAction: 'CLEAR_LOCALSTORAGE' }, timestamp: new Date().toISOString()\n  };\n  return JSON.stringify(out);\n}\n\nconst route = (row.route || 'Lobby').toString();\nconst isNew = route === 'Lobby';\nconst decision = {\n  case: isNew ? 'OK_NEW' : 'OK_KNOWN', userId, finalUserId: userId,\n  nextRoute: route, isAuthenticated: true, isNewUser: isNew, isReturningUser: !isNew,\n  action: route === 'Lobby' ? 'GO_LOBBY' : 'GO_' + route.toUpperCase(),\n  routeData: {}\n};\n\nreturn JSON.stringify({ routingDecision: decision, nextRoute: decision.nextRoute, isAuthenticated: decision.isAuthenticated, userId: decision.finalUserId, case: decision.case, action: decision.action, error: null, routeData: decision.routeData, timestamp: new Date().toISOString() });\n",
+          "customFunctionUpdateState": []
+        },
+        "outputAnchors": [
+          {
+            "id": "customFunctionAgentflow_1-output-customFunctionAgentflow",
+            "label": "Custom Function",
+            "name": "customFunctionAgentflow"
+          }
+        ],
+        "outputs": {},
+        "selected": false
+      },
+      "type": "agentFlow",
+      "width": 114,
+      "height": 66,
+      "selected": false,
+      "positionAbsolute": {
+        "x": 605.3566717816593,
+        "y": 63.94296601133411
+      },
+      "dragging": false
+    }
+  ],
+  "edges": [
+    {
+      "source": "startAgentflow_0",
+      "sourceHandle": "startAgentflow_0-output-startAgentflow",
+      "target": "customFunctionAgentflow_0",
+      "targetHandle": "customFunctionAgentflow_0",
+      "data": {
+        "sourceColor": "#7EE787",
+        "targetColor": "#E4B7FF",
+        "isHumanInput": false
+      },
+      "type": "agentFlow",
+      "id": "startAgentflow_0-startAgentflow_0-output-startAgentflow-customFunctionAgentflow_0-customFunctionAgentflow_0"
+    },
+    {
+      "source": "customFunctionAgentflow_0",
+      "sourceHandle": "customFunctionAgentflow_0-output-customFunctionAgentflow",
+      "target": "customFunctionAgentflow_1",
+      "targetHandle": "customFunctionAgentflow_1",
+      "data": {
+        "sourceColor": "#E4B7FF",
+        "targetColor": "#E4B7FF",
+        "isHumanInput": false
+      },
+      "type": "agentFlow",
+      "id": "customFunctionAgentflow_0-customFunctionAgentflow_0-output-customFunctionAgentflow-customFunctionAgentflow_1-customFunctionAgentflow_1"
+    }
+  ]
+}
