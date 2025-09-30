@@ -1,604 +1,454 @@
-require('dotenv').config();
 const express = require('express');
-const cors = require('cors');
-const morgan = require('morgan');
-const { Pool } = require('pg');
-const jwt = require('jsonwebtoken');
 const axios = require('axios');
-const { z } = require('zod');
-const crypto = require('crypto');
-const {
-  generateRegistrationOptions,
-  verifyRegistrationResponse,
-  generateAuthenticationOptions,
-  verifyAuthenticationResponse
-} = require('@simplewebauthn/server');
-
+const cors = require('cors');
+const { Pool } = require('pg');
+const { v4: uuidv4 } = require('uuid');
 const app = express();
-const port = process.env.PORT || 3000;
 
-// Environment validation
-const requiredEnvVars = ['DATABASE_HOST', 'DATABASE_USER', 'DATABASE_PASSWORD', 'DATABASE_NAME', 'JWT_SECRET'];
-for (const envVar of requiredEnvVars) {
-  if (!process.env[envVar]) {
-    console.error(`❌ Missing required environment variable: ${envVar}`);
-    process.exit(1);
-  }
-}
-
-// Database connection
+// PostgreSQL connection usando las variables correctas
 const pool = new Pool({
-  host: process.env.DATABASE_HOST,
-  port: process.env.DATABASE_PORT || 5432,
-  user: process.env.DATABASE_USER,
-  password: process.env.DATABASE_PASSWORD,
-  database: process.env.DATABASE_NAME,
-  ssl: process.env.DATABASE_SSL === 'true'
-});
-
-// Test database connection (non-fatal for now)
-pool.connect((err, client, release) => {
-  if (err) {
-    console.error('❌ Error connecting to database:', err.message);
-    console.log('⚠️  Continuing without database connection for testing...');
-  } else {
-    console.log('✅ Database connected successfully');
-    release();
-  }
+  host: process.env.DATABASE_HOST || process.env.PGHOST || 'mana-pg',
+  port: process.env.DATABASE_PORT || process.env.PGPORT || 5432,
+  user: process.env.DATABASE_USER || process.env.PGUSER || 'mana', 
+  password: process.env.DATABASE_PASSWORD || process.env.PGPASSWORD || 'temporal-password-123',
+  database: process.env.DATABASE_NAME || process.env.PGDATABASE || 'mana',
+  ssl: false
 });
 
 // CORS configuration
-const rawOrigins = process.env.CORS_ORIGINS || 'https://manaproject.app,https://www.manaproject.app';
-const allowList = rawOrigins.split(',').map(s => s.trim()).filter(Boolean);
-
-const corsOptions = {
-  origin: function (origin, callback) {
-    // Allow no origin (server-to-server)
-    if (!origin) return callback(null, true);
-    
-    // Allow production domains
-    if (allowList.includes(origin)) return callback(null, true);
-    
-    // Allow any localhost port for development
-    if (origin.match(/^https?:\/\/localhost:\d+$/)) {
-      return callback(null, true);
-    }
-    
-    return callback(new Error('CORS not allowed for origin: ' + origin));
-  },
-  methods: ['GET', 'HEAD', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+app.use(cors({
+  origin: ["https://www.manaproject.app", "https://manaproject.app"],
   credentials: true,
-  maxAge: 86400
-};
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
 
 // Middleware
-app.disable('x-powered-by');
-app.use(morgan('tiny'));
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// CORS setup
-app.options('/api/*', cors(corsOptions));
-app.use('/api', cors(corsOptions));
+// =============================================================================
+// 🔍 DEBUG ROUTE - Para inspeccionar el body crudo desde el front
+// =============================================================================
+app.post('/forbff/echo', (req, res) => {
+  console.log('🔍 DEBUG ECHO - Raw body from frontend:', JSON.stringify(req.body, null, 2));
+  res.json({
+    receivedAt: new Date().toISOString(),
+    rawBody: req.body,
+    headers: {
+      'content-type': req.headers['content-type'],
+      'user-agent': req.headers['user-agent']
+    }
+  });
+});
 
-// CORS para endpoints principales
-app.options('/hola', cors(corsOptions));
-app.options('/forbff', cors(corsOptions));
-app.use('/hola', cors(corsOptions));
-app.use('/forbff', cors(corsOptions));
+// UUID validation
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[4][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-// Store pool and config in app.locals for routes
-app.locals.pool = pool;
-app.locals.config = {
-  jwtSecret: process.env.JWT_SECRET,
-  jwtTtl: process.env.JWT_TTL || '3600',
-  flowiseUrl: process.env.FLOWISE_URL || 'http://flowise:3000',
-  flowiseApiKey: process.env.FLOWISE_API_KEY,
-  authAgentflowId: process.env.AUTH_AGENTFLOW_ID || 'b77e8611-c327-46d9-8a1c-964426675ebe',
-  rpId: process.env.RP_ID || 'manaproject.app',
-  origin: process.env.ORIGIN || 'https://manaproject.app'
-};
-
-// In-memory challenge stores (dev/local)
-const regChallengeByUser = new Map(); // userId -> challenge
-const issuedAuthChallenges = new Set(); // challenges issued for auth
-
-// JWT Authentication middleware
-function requireAuth(req, res, next) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({
-      ok: false,
-      error: 'unauthorized',
-      message: 'Bearer token required'
-    });
-  }
-
-  const token = authHeader.slice(7);
-  try {
-    const decoded = jwt.verify(token, app.locals.config.jwtSecret);
-    req.user = decoded;
-    next();
-  } catch (error) {
-    return res.status(401).json({
-      ok: false,
-      error: 'unauthorized',
-      message: 'Invalid token'
-    });
-  }
+function isValidUUID(str) {
+  return UUID_REGEX.test(str);
 }
 
-// Basic validation middleware
-function validateBody(schema) {
-  return (req, res, next) => {
-    try {
-      req.body = schema.parse(req.body);
-      next();
-    } catch (error) {
-      return res.status(400).json({
-        ok: false,
-        error: 'validation_error',
-        message: 'Invalid request body',
-        details: error.errors
-      });
-    }
-  };
-}
-
-// Basic schemas
-const EchoSchema = z.object({
-  message: z.string().optional(),
-  data: z.any().optional()
-});
-
-const ShareChatSchema = z.object({
-  sessionId: z.string().uuid(),
-  title: z.string().optional()
-});
-
-// Health endpoint
-app.get('/health', (req, res) => {
-  res.status(200).json({
-    ok: true,
-    service: 'mana-auth-bff',
-    timestamp: new Date().toISOString(),
-    version: '1.0.0'
-  });
-});
-
-// Diagnostic endpoint - test Flowise connectivity
-app.get('/diag', async (req, res) => {
-  try {
-    const FLOWISE_URL = app.locals.config.flowiseUrl || 'http://flowise:3001';
-    const AUTH_AGENTFLOW_ID = app.locals.config.authAgentflowId || 'b77e8611-c327-46d9-8a1c-964426675ebe';
-    const FLOWISE_API_KEY = app.locals.config.flowiseApiKey;
-
-    const url = `${FLOWISE_URL}/prediction/${AUTH_AGENTFLOW_ID}`;
-    const headers = {
-      'Content-Type': 'application/json',
-    };
-
-    if (FLOWISE_API_KEY) {
-      headers['x-api-key'] = FLOWISE_API_KEY;
-      headers['Authorization'] = `Bearer ${FLOWISE_API_KEY}`;
-    }
-
-    const payload = {
-      question: '',
-      overrideConfig: {
-        startState: [['userId','health'],['userLanguage','es']]
-      }
-    };
-
-    const response = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(payload)
-    });
-
-    const text = await response.text();
-
-    res.status(200).json({
-      ok: response.ok,
-      status: response.status,
-      statusText: response.statusText,
-      responseLength: text.length,
-      flowiseUrl: FLOWISE_URL,
-      hasApiKey: !!FLOWISE_API_KEY,
-      headers: Object.keys(headers),
-      timestamp: new Date().toISOString()
-    });
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: String(error),
-      message: 'Flowise connection failed',
-      timestamp: new Date().toISOString()
-    });
-  }
-});
-
-// Echo endpoint for testing
-app.post('/api/rpc/echo', validateBody(EchoSchema), (req, res) => {
-  res.status(200).json({ 
-    ok: true, 
-    echo: req.body,
-    timestamp: new Date().toISOString()
-  });
-});
-
-// ===== WebAuthn Registration =====
-app.post('/api/auth/webauthn/register/begin', async (req, res) => {
-  try {
-    const { username, displayName } = req.body || {};
-    if (!username || !displayName) {
-      return res.status(400).json({ ok: false, error: 'bad_request', message: 'username and displayName required' });
-    }
-
-    const userId = crypto.randomUUID();
-
-    // Create user row
-    await app.locals.pool.query(
-      'INSERT INTO users (id, email, email_verified, preferences) VALUES ($1, $2, $3, $4)',
-      [userId, null, false, JSON.stringify({ profile: { username, displayName } })]
-    );
-
-    const options = await generateRegistrationOptions({
-      rpName: 'MANA Project',
-      rpID: app.locals.config.rpId,
-      userID: userId,
-      userName: String(username),
-      timeout: 120000,
-      attestationType: 'none',
-      authenticatorSelection: {
-        userVerification: 'discouraged', // Allow PIN and other convenient methods
-        residentKey: 'preferred',
-        requireResidentKey: false,
-      },
-      supportedAlgorithmIDs: [-7, -257],
-    });
-
-    // Persist challenge in memory for this user (for local dev)
-    regChallengeByUser.set(userId, options.challenge);
-
-    return res.status(200).json({ ...options, userId });
-  } catch (err) {
-    console.error('register/begin error:', err);
-    return res.status(500).json({ ok: false, error: 'internal_error', message: 'Failed to begin registration' });
-  }
-});
-
-app.post('/api/auth/webauthn/register/finish', async (req, res) => {
-  try {
-    const { userId } = req.body || {};
-    if (!userId) {
-      return res.status(400).json({ ok: false, error: 'bad_request', message: 'userId missing' });
-    }
-
-    const expectedChallenge = regChallengeByUser.get(userId);
-    if (!expectedChallenge) {
-      return res.status(400).json({ ok: false, error: 'invalid_challenge', message: 'No registration in progress' });
-    }
-
-    const verification = await verifyRegistrationResponse({
-      response: req.body,
-      expectedChallenge,
-      expectedOrigin: app.locals.config.origin,
-      expectedRPID: app.locals.config.rpId,
-      requireUserVerification: false,
-    });
-
-    if (!verification.verified || !verification.registrationInfo) {
-      return res.status(400).json({ ok: false, error: 'verification_failed', message: 'Registration verification failed' });
-    }
-
-    const { credentialPublicKey, credentialID, counter } = verification.registrationInfo;
-
-    // Store credential
-    await app.locals.pool.query(
-      'INSERT INTO webauthn_credentials (credential_id, user_id, public_key, counter, transports) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (credential_id) DO NOTHING',
-      [Buffer.from(credentialID), userId, Buffer.from(credentialPublicKey).toString('base64'), counter, null]
-    );
-
-    // Clear challenge
-    regChallengeByUser.delete(userId);
-
-    const token = jwt.sign({ userId }, app.locals.config.jwtSecret, { expiresIn: app.locals.config.jwtTtl });
-    return res.status(200).json({ ok: true, token, user: { id: userId } });
-  } catch (err) {
-    console.error('register/finish error:', err);
-    return res.status(500).json({ ok: false, error: 'internal_error', message: 'Failed to complete registration' });
-  }
-});
-
-// ===== WebAuthn Authentication =====
-app.post('/api/auth/webauthn/authenticate/begin', async (req, res) => {
-  try {
-    const options = await generateAuthenticationOptions({
-      rpID: app.locals.config.rpId,
-      timeout: 120000,
-      userVerification: 'discouraged', // Allow PIN and other convenient methods
-      allowCredentials: [], // rely on resident/discoverable credentials
-      authenticatorSelection: {
-        userVerification: 'discouraged',
-        residentKey: 'preferred',
-        requireResidentKey: false,
-      }
-    });
-
-    issuedAuthChallenges.add(options.challenge);
-    return res.status(200).json(options);
-  } catch (err) {
-    console.error('authenticate/begin error:', err);
-    return res.status(500).json({ ok: false, error: 'internal_error', message: 'Failed to begin authentication' });
-  }
-});
-
-app.post('/api/auth/webauthn/authenticate/finish', async (req, res) => {
-  try {
-    const body = req.body || {};
-    const credId = body.id;
-    if (!credId) {
-      return res.status(400).json({ ok: false, error: 'bad_request', message: 'Missing credential id' });
-    }
-
-    // Find credential owner and public key
-    const rawIdArray = body.rawId ? Uint8Array.from(body.rawId) : null;
-    const rawIdBuf = rawIdArray ? Buffer.from(rawIdArray) : null;
-    const credRes = await app.locals.pool.query(
-      'SELECT user_id, public_key, counter FROM webauthn_credentials WHERE credential_id = $1',
-      [rawIdBuf]
-    );
-    if (credRes.rowCount === 0) {
-      return res.status(404).json({ ok: false, error: 'credential_not_found', message: 'Unknown credential' });
-    }
-
-    const { user_id: userId, public_key: publicKeyB64, counter } = credRes.rows[0];
-    const authenticator = {
-      credentialPublicKey: Buffer.from(publicKeyB64, 'base64'),
-      counter: Number(counter) || 0,
-    };
-
-    // Extract challenge from clientDataJSON and validate it was issued
-    const clientData = Buffer.from(Uint8Array.from(body.response?.clientDataJSON || [])).toString('utf8');
-    const clientJson = JSON.parse(clientData);
-    const expectedChallenge = clientJson.challenge;
-    if (!issuedAuthChallenges.has(expectedChallenge)) {
-      return res.status(400).json({ ok: false, error: 'invalid_challenge', message: 'Auth challenge not recognized' });
-    }
-
-    const verification = await verifyAuthenticationResponse({
-      response: body,
-      expectedChallenge,
-      expectedOrigin: app.locals.config.origin,
-      expectedRPID: app.locals.config.rpId,
-      authenticator,
-      requireUserVerification: false,
-    });
-
-    if (!verification.verified || !verification.authenticationInfo) {
-      return res.status(401).json({ ok: false, error: 'verification_failed', message: 'Authentication failed' });
-    }
-
-    const { newCounter } = verification.authenticationInfo;
-    await app.locals.pool.query(
-      'UPDATE webauthn_credentials SET counter = $1 WHERE credential_id = $2',
-      [newCounter, rawIdBuf]
-    );
-
-    issuedAuthChallenges.delete(expectedChallenge);
-
-    const token = jwt.sign({ userId }, app.locals.config.jwtSecret, { expiresIn: app.locals.config.jwtTtl });
-    return res.status(200).json({ ok: true, token, user: { id: userId } });
-  } catch (err) {
-    console.error('authenticate/finish error:', err);
-    return res.status(500).json({ ok: false, error: 'internal_error', message: 'Failed to complete authentication' });
-  }
-});
-
-// Simple local dev chat stub (no auth required)
-app.post('/api/chat', (req, res) => {
-  const { message } = req.body || {};
-  res.status(200).json({
-    ok: true,
-    response: message ? `Echo: ${message}` : 'Hola desde MANA local',
-    timestamp: new Date().toISOString()
-  });
-});
-
-
-
-// Share chat endpoint
-app.post('/api/share/chat', requireAuth, validateBody(ShareChatSchema), async (req, res) => {
-  const { sessionId, title } = req.body;
-  const { pool } = req.app.locals;
+// User validation logic
+async function validateUserId(userId) {
+  console.log('🔍 Validating userId:', userId);
   
   try {
-    // Check if chat session exists
-    const chatCheck = await pool.query(
-      'SELECT COUNT(*) FROM chat_message WHERE "sessionId" = $1',
-      [sessionId]
-    );
-    
-    if (parseInt(chatCheck.rows[0].count) === 0) {
-      return res.status(404).json({
-        ok: false,
-        error: 'chat_not_found',
-        message: 'Chat session not found'
-      });
+    // Case 1: Empty userId -> NEW user
+    if (!userId || userId.trim() === '') {
+      console.log('📝 Creating new user (empty userId)');
+      const newUserId = uuidv4();
+      
+      // Insert new user in database (adapted to existing table structure)
+      await pool.query(
+        'INSERT INTO users (id, email_verified, preferences, created_at) VALUES ($1, $2, $3, NOW())',
+        [newUserId, false, '{}']
+      );
+      
+      return {
+        case: 'OK_NEW',
+        userId: newUserId,
+        message: 'New user created'
+      };
     }
-
-    // Create share entry
-    const shareId = sessionId; // Use sessionId as shareId for simplicity
-    await pool.query(
-      'INSERT INTO workspace_shared ("workspaceId", "sharedItemId", "itemType") VALUES ($1, $2, $3) ON CONFLICT ("sharedItemId", "itemType") DO NOTHING',
-      [req.user.workspaceId || '00000000-0000-0000-0000-000000000000', shareId, 'CHAT_SESSION']
-    );
-
-    res.status(200).json({
-      ok: true,
-      shareId,
-      url: `https://manaproject.app/chat/${shareId}`,
-      title: title || 'Shared Chat'
-    });
+    
+    // Case 2: Invalid UUID format -> ERROR
+    if (!isValidUUID(userId)) {
+      console.log('❌ Invalid UUID format:', userId);
+      return {
+        case: 'ERR_INVALID',
+        userId: null,
+        message: 'Invalid userId format - corruption detected'
+      };
+    }
+    
+    // Case 3: Valid UUID - check if exists in database
+    const result = await pool.query('SELECT id, email, created_at FROM users WHERE id = $1', [userId]);
+    
+    if (result.rows.length === 0) {
+      // Valid UUID but not found in DB -> MANIPULATION
+      console.log('⚠️ Valid UUID but not found in database:', userId);
+      return {
+        case: 'ERR_NOT_FOUND', 
+        userId: null,
+        message: 'Valid userId but not found - possible manipulation'
+      };
+    }
+    
+    // Case 4: Valid UUID and exists in DB -> KNOWN user
+    console.log('✅ Known user found:', userId, 'created:', result.rows[0].created_at);
+    return {
+      case: 'OK_KNOWN',
+      userId: userId,
+      message: 'Known user authenticated'
+    };
+    
   } catch (error) {
-    console.error('Share chat error:', error);
-    res.status(500).json({
-      ok: false,
-      error: 'internal_error',
-      message: 'Failed to create share'
+    console.error('💥 Database error:', error.message);
+    return {
+      case: 'ERR_INTERNAL',
+      userId: null, 
+      message: 'Database connection error'
+    };
+  }
+}
+
+// =============================================================================
+// 🔄 PREDICT ROUTE - Paso transparente con logs detallados  
+// =============================================================================
+app.post('/forbff/predict', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const vars = body?.overrideConfig?.vars || {};
+    
+    console.log('🔥 DBG front->BFF vars:', JSON.stringify(vars, null, 2));
+    
+    const payload = {
+      question: typeof body.question === 'string' ? body.question : 'boot',
+      streaming: false,
+      overrideConfig: {
+        sessionId: body.sessionId || `${uuidv4()}`,
+        vars: vars  // PASO TRANSPARENTE - no tocamos nada
+      }
+    };
+    
+    console.log('🔥 DBG BFF->Flowise payload:', JSON.stringify(payload, null, 2));
+    
+    const CHATFLOW_ID = process.env.AUTH_AGENTFLOW_ID || process.env.CHATFLOW_ID || '6e6088ac-e323-46de-acbb-67884fd57f2a';
+    const FLOWISE_URL = process.env.FLOWISE_URL || 'http://flowise:3000';
+    const url = `${FLOWISE_URL}/api/v1/prediction/${CHATFLOW_ID}`;
+    
+    const response = await axios.post(url, payload, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 15000
     });
+    
+    console.log('🔥 FLOWISE RESPONDED:', response.status);
+    
+    // Devolver tanto el payload enviado como la respuesta para debugging
+    res.status(response.status).json({
+      sentPayload: payload,
+      flowiseResponse: response.data
+    });
+    
+  } catch (err) {
+    console.error('🔥 PREDICT ERROR:', err.message);
+    const status = err.response?.status ?? 502;
+    const body = err.response?.data ?? { error: "Flowise upstream error" };
+    res.status(status).json({ error: body, sentPayload: req.body });
   }
 });
 
-// Get shared chat
-app.get('/api/chat/:shareId', async (req, res) => {
-  const { shareId } = req.params;
-  const { pool } = req.app.locals;
-
+// =============================================================================
+// 🔄 UNIVERSAL HANDLER - Soporta AMBOS formatos (legacy + nuevo)
+// =============================================================================
+async function handleUniversalRequest(req, res) {
   try {
-    // Check if chat is shared
-    const shareCheck = await pool.query(
-      'SELECT * FROM workspace_shared WHERE "sharedItemId" = $1 AND "itemType" = $2',
-      [shareId, 'CHAT_SESSION']
-    );
+    console.log('🔥 UNIVERSAL REQUEST RECEIVED:', JSON.stringify(req.body, null, 2));
+    
+    // Detectar formato: ¿tiene overrideConfig.vars o campos directos?
+    const body = req.body || {};
+    const hasOverrideConfig = body.overrideConfig && body.overrideConfig.vars;
+    
+    let userId, userLanguage, question;
+    
+    if (hasOverrideConfig) {
+      // FORMATO NUEVO: { overrideConfig: { vars: { userId, userLanguage } } }
+      console.log('📦 Detected NEW format (overrideConfig.vars)');
+      userId = body.overrideConfig.vars.userId;
+      userLanguage = body.overrideConfig.vars.userLanguage;
+      question = body.question;
+      
+      // PASO TRANSPARENTE - enviamos directo a Flowise
+      const payload = {
+        question: typeof question === 'string' ? question : 'boot',
+        streaming: false,
+        overrideConfig: {
+          sessionId: body.sessionId || `${uuidv4()}`,
+          vars: {
+            userId: userId || '',
+            userLanguage: userLanguage || 'es',
+            PGHOST: 'mana-pg',
+            PGPORT: '5432',
+            PGUSER: 'mana',
+            PGPASSWORD: 'CambiaEstaClaveFuerte',
+            PGDATABASE: 'mana',
+            PGSSLMODE: 'disable'
+          }
+        }
+      };
+      
+      console.log('🔥 SENDING NEW FORMAT TO FLOWISE:', JSON.stringify(payload, null, 2));
+      
+      const CHATFLOW_ID = process.env.AUTH_AGENTFLOW_ID || process.env.CHATFLOW_ID || '6e6088ac-e323-46de-acbb-67884fd57f2a';
+      const FLOWISE_URL = process.env.FLOWISE_URL || 'http://flowise:3000';
+      const url = `${FLOWISE_URL}/api/v1/prediction/${CHATFLOW_ID}`;
+      
+      const response = await axios.post(url, payload, {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 15000
+      });
+      
+      console.log('🔥 FLOWISE RESPONDED:', response.status);
+      
+      // Respuesta compatible con frontend
+      return res.status(200).json({
+        version: '1.0.0',
+        success: true,
+        case: 'TRANSPARENT',
+        message: 'Request forwarded transparently',
+        userId: userId,
+        webauthn: { action: 'authenticate' },
+        nextRoute: 'Game',
+        uiState: { turn: 1, step: 'ready', counters: { energy: 100 } },
+        playerState: { chatId: response.data.chatId },
+        flowiseData: response.data
+      });
+      
+    } else {
+      // FORMATO LEGACY: { userId, userLanguage, question }
+      console.log('📦 Detected LEGACY format (direct fields)');
+      userId = body.userId;
+      userLanguage = body.userLanguage;
+      question = body.question;
+      
+      const q = (question && question.trim().length) ? question : 'boot';
+      
+      // Validate user
+      const userValidation = await validateUserId(userId);
+      console.log('🎯 User validation result:', userValidation);
+      
+      // If error, return early without calling Flowise
+      if (userValidation.case.startsWith('ERR_')) {
+        return res.status(200).json({
+          version: '1.0.0',
+          success: false,
+          case: userValidation.case,
+          message: userValidation.message,
+          proposedUserId: userValidation.case === 'OK_NEW' ? userValidation.userId : undefined,
+          webauthn: { action: 'skip' },
+          nextRoute: 'Lobby',
+          uiState: { turn: 0, step: 'intro', counters: { energy: 0 } },
+          playerState: {}
+        });
+      }
+      
+      // Use validated userId for Flowise
+      const validatedUserId = userValidation.userId;
+      console.log('🔥 SENDING LEGACY TO FLOWISE - UserId:', validatedUserId, 'Question:', q);
+      
+      const payload = {
+        question: q,
+        overrideConfig: {
+          sessionId: req.body.sessionId || `${uuidv4()}`,
+          vars: {
+            userId: validatedUserId || "",
+            userLanguage: userLanguage || "es",
+            PGHOST: "mana-pg",
+            PGPORT: "5432",
+            PGUSER: "mana",
+            PGPASSWORD: "CambiaEstaClaveFuerte",
+            PGDATABASE: "mana",
+            PGSSLMODE: "disable"
+          }
+        },
+        streaming: false
+      };
+      
+      console.log('🔥 LEGACY FLOWISE COMPLETE PAYLOAD:', JSON.stringify(payload, null, 2));
+      
+      const CHATFLOW_ID = process.env.AUTH_AGENTFLOW_ID || process.env.CHATFLOW_ID || '6e6088ac-e323-46de-acbb-67884fd57f2a';
+      const FLOWISE_URL = process.env.FLOWISE_URL || 'http://flowise:3000';
+      const url = `${FLOWISE_URL}/api/v1/prediction/${CHATFLOW_ID}`;
+      
+      const response = await axios.post(url, payload, {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 15000
+      });
+      
+      console.log('🔥 FLOWISE RESPONDED:', response.status);
+      
+      // Return success with validation info
+      return res.status(200).json({
+        version: '1.0.0',
+        success: true,
+        case: userValidation.case,
+        message: userValidation.message,
+        userId: validatedUserId,
+        proposedUserId: userValidation.case === 'OK_NEW' ? validatedUserId : undefined,
+        webauthn: { action: 'authenticate' },
+        nextRoute: 'Game',
+        uiState: { turn: 1, step: 'ready', counters: { energy: 100 } },
+        playerState: { chatId: response.data.chatId },
+        flowiseData: response.data
+      });
+    }
+    
+  } catch (err) {
+    console.error('🔥 UNIVERSAL ERROR:', err.message);
+    res.status(500).json({
+      version: '1.0.0', 
+      success: false,
+      case: 'ERR_INTERNAL',
+      message: 'Internal server error'
+    });
+  }
+}
 
-    if (shareCheck.rows.length === 0) {
-      return res.status(404).json({
-        ok: false,
-        error: 'share_not_found',
-        message: 'Shared chat not found'
+// =============================================================================
+// 📍 ROUTES - Asignar handlers
+// =============================================================================
+
+// Handler universal que soporta AMBOS formatos
+app.post('/forbff', handleUniversalRequest);
+
+// Handler legacy para /hola (solo formato antiguo)
+// Función handleLegacyRequest corregida con validación de payload y propagación de text
+async function handleLegacyRequest(req, res) {
+  try {
+    console.log('🔥 /hola REQUEST RECEIVED:', JSON.stringify(req.body, null, 2));
+
+    // ✅ VALIDACIÓN DE PAYLOAD
+    const b = req.body;
+
+    if (!b || typeof b.question !== 'string') {
+      return res.status(400).json({
+        success: false,
+        case: 'ERR_INPUT',
+        message: 'question requerida'
       });
     }
 
-    // Get chat messages
-    const messages = await pool.query(
-      `SELECT cm.*, cf.name as flow_name 
-       FROM chat_message cm 
-       JOIN chat_flow cf ON cm.chatflowid = cf.id 
-       WHERE cm."sessionId" = $1 
-       ORDER BY cm."createdDate" ASC`,
-      [shareId]
-    );
+    // ✅ HARDENING: NO se permite question dentro de vars
+    if (b.overrideConfig?.vars && ('question' in b.overrideConfig.vars || 'overrideConfig' in b.overrideConfig.vars)) {
+      return res.status(400).json({
+        success: false,
+        case: 'ERR_INPUT',
+        message: 'payload inválido: no anides question/overrideConfig en vars'
+      });
+    }
 
-    res.status(200).json({
-      ok: true,
-      shareId,
-      messages: messages.rows,
-      shared: true
-    });
-  } catch (error) {
-    console.error('Get shared chat error:', error);
-    res.status(500).json({
-      ok: false,
-      error: 'internal_error',
-      message: 'Failed to retrieve shared chat'
-    });
-  }
-});
+    console.log('🔥 VALIDATED PAYLOAD - question:', b.question, 'overrideConfig:', b.overrideConfig);
 
-// Handler único para /hola y /forbff
-async function handleAuth(req, res) {
-  try {
-    console.log('📨 INCOMING REQUEST:', {
-      method: req.method,
-      path: req.path,
-      body: req.body,
-      headers: req.headers['content-type']
-    });
-    
-    const { question, userId, userLanguage } = req.body || {};
-    console.log('📋 EXTRACTED VALUES:', { question, userId, userLanguage });
-    
-    const q = (typeof question === 'string' && question.trim().length) ? question : 'boot';
-    console.log('✅ FINAL QUESTION:', q);
+    // ✅ LLAMAR A FLOWISE Y REENVÍAR SU SALIDA TAL CUAL EN `text`
+    const CHATFLOW_ID = process.env.AUTH_AGENTFLOW_ID || process.env.CHATFLOW_ID || '6e6088ac-e323-46de-acbb-67884fd57f2a';
+    const FLOWISE_URL = process.env.FLOWISE_URL || 'http://flowise:3000';
+    const url = `${FLOWISE_URL}/api/v1/prediction/${CHATFLOW_ID}`;
 
     const flowisePayload = {
-      question: q,
-      overrideConfig: {
-        vars: { userId, userLanguage }
-      },
+      question: b.question,
+      overrideConfig: b.overrideConfig || {},
       streaming: false
     };
 
-    console.log('→ Enviando a Flowise:', JSON.stringify(flowisePayload));
+    console.log('🔥 SENDING TO FLOWISE:', JSON.stringify(flowisePayload, null, 2));
 
-    const CHATFLOW_ID = process.env.CHATFLOW_ID || process.env.AUTH_AGENTFLOW_ID || 'b77e8611-c327-46d9-8a1c-964426675ebe';
-    const FLOWISE_URL = process.env.FLOWISE_URL || 'http://flowise:3001';
-    const url = `${FLOWISE_URL}/api/v1/prediction/${CHATFLOW_ID}`;
-
-    const response = await axios.post(url, flowisePayload, {
+    const flowiseResp = await axios.post(url, flowisePayload, {
       headers: { 'Content-Type': 'application/json' },
       timeout: 15000
     });
 
-    const data = response.data;
+    console.log('🔥 FLOWISE RESPONSE STATUS:', flowiseResp.status);
+    console.log('🔥 FLOWISE RESPONSE DATA:', JSON.stringify(flowiseResp.data, null, 2));
 
-    // ACEPTAR texto u objeto (no parsear a la fuerza)
-    if (typeof data === 'string') {
-      return res.status(200).json({ ok: true, case: 'OK', text: data });
-    }
-    if (data && typeof data === 'object') {
-      return res.status(200).json({ ok: true, case: 'OK', data });
+    // ✅ SI EL NODO ROUTER RETORNA STRING JSON:
+    if (typeof flowiseResp.data?.text === 'string' && flowiseResp.data.text.trim() !== '') {
+      console.log('🔥 RETURNING TRANSPARENT RESPONSE WITH TEXT');
+      return res.status(200).json({
+        success: true,
+        case: 'TRANSPARENT',
+        text: flowiseResp.data.text
+      });
     }
 
+    // ✅ SI NO HAY TEXT, ES ERROR DE FLUJO
+    console.log('🔥 EMPTY OUTPUT - RETURNING 502');
     return res.status(502).json({
-      ok: false,
-      case: 'ERR_GATEWAY',
-      message: 'Unexpected response type from upstream'
-    });
-  } catch (err) {
-    console.error('Auth error:', err?.response?.status, err?.response?.data || err.message);
-    return res.status(500).json({
-      ok: false,
+      success: false,
       case: 'ERR_INTERNAL',
-      message: 'AuthBFF error'
+      message: 'EMPTY_OUTPUT'
+    });
+
+  } catch (e) {
+    console.error('🔥 /hola ERROR:', e.message);
+    return res.status(500).json({
+      success: false,
+      case: 'ERR_INTERNAL',
+      message: e?.message || 'Internal server error'
     });
   }
 }
+app.post('/hola', handleLegacyRequest);
 
-// Endpoints usando el handler compartido
-app.post('/forbff', handleAuth);
-app.post('/hola', handleAuth);
-
-// Public Flowise API endpoint (no auth required)
-const flowiseRouter = require('./routes/flowise');
-app.use('/flowise-api', flowiseRouter);
-
-// Fallback 404 for /api
-app.use('/api', (req, res) => {
-  res.status(404).json({ 
-    ok: false, 
-    error: 'not_found',
-    message: 'API endpoint not found' 
-  });
-});
-
-// Global error handler
-app.use((err, req, res, next) => {
-  console.error('Global error:', err);
-  
-  if (err && /CORS not allowed/.test(err.message)) {
-    return res.status(403).json({ 
-      ok: false, 
-      error: 'cors_forbidden', 
-      message: err.message 
+// Health check endpoint
+app.get('/health', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    const userCount = await pool.query('SELECT COUNT(*) as count FROM users');
+    res.json({ 
+      status: 'healthy', 
+      database: 'connected',
+      userCount: userCount.rows[0].count 
+    });
+  } catch (error) {
+    res.status(500).json({ 
+      status: 'unhealthy', 
+      database: 'disconnected', 
+      error: error.message 
     });
   }
-  
-  return res.status(500).json({ 
-    ok: false, 
-    error: 'internal_error', 
-    message: 'Internal server error' 
-  });
 });
 
-// Start server
-app.listen(port, () => {
-  console.log(`🚀 MANA Auth-BFF listening on port ${port}`);
-  console.log(`🌐 CORS origins: ${allowList.join(', ')}`);
-  console.log(`🗄️  Database: ${process.env.DATABASE_HOST}:${process.env.DATABASE_PORT}/${process.env.DATABASE_NAME}`);
-  console.log(`✨ Environment: ${process.env.NODE_ENV || 'development'}`);
-});
+// Puerto de escucha
+const PORT = process.env.PORT || 3000;
+
+// Test database connection (SINCRONAMENTE ANTES DE ARRANCAR)
+console.log('🔗 Testing database connection...');
+pool.query('SELECT NOW() as current_time')
+  .then(result => {
+    console.log('✅ Database connected successfully:', result.rows[0].current_time);
+    
+    // Show users count
+    return pool.query('SELECT COUNT(*) as count FROM users');
+  })
+  .then(userCountResult => {
+    console.log('👥 Total users in database:', userCountResult.rows[0].count);
+    
+    // Start server
+    app.listen(PORT, () => {
+        console.log('🚀 Auth-BFF server running on port ' + PORT);
+        console.log('📡 Routes available:');
+        console.log('   🔍 /forbff/echo - Debug endpoint');
+        console.log('   🔄 /forbff/predict - Debug transparent endpoint');
+        console.log('   🔄 /forbff - UNIVERSAL handler (NEW + LEGACY formats)');
+        console.log('   🔄 /hola - Legacy handler only');
+    });
+  })
+  .catch(error => {
+    console.error('💥 Database connection failed:', error.message);
+    app.listen(PORT, () => {
+        console.log('🚀 Auth-BFF server running on port ' + PORT + ' (DATABASE ERROR!)');
+    });
+  });
 
 module.exports = app;
